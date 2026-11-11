@@ -14,7 +14,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from scripts.repo_context import RepoContextError, collect_repo_context, format_repo_prompt
+from scripts.repo_context import RepoContextError, collect_repo_context, format_repo_prompt, review_coverage
 from scripts.smart_reviewer import SmartReviewer
 from scripts.agent_tools import find_test_commands, run_command
 from scripts.knowledge_search import KnowledgeSearch, PROJECT_ROOT
@@ -136,12 +136,13 @@ def review(args: argparse.Namespace) -> int:
         else:
             print(f"[INFO] {message}")
         return 0
-    if context["diff_truncated"]:
+    coverage = review_coverage(context)
+    if coverage['coverage'] == 'partial':
         if args.require_full:
-            print(f"[ERROR] diff 共 {context['diff_total_chars']} 字符，超出 --max-diff {args.max_diff}，"
-                  "无法完成完整审查；请调大 --max-diff 或分批提交。", file=sys.stderr)
+            print(f"[ERROR] {coverage['coverage_note']}；无法完成完整审查。"
+                  "截断时可调大 --max-diff 或分批提交；二进制内容需另外验证。", file=sys.stderr)
             return 1
-        print("[WARN] diff 超出大小限制，当前结果仅覆盖前半部分（报告中 coverage=partial）。", file=sys.stderr)
+        print(f"[WARN] {coverage['coverage_note']}（coverage=partial）。", file=sys.stderr)
 
     prompt = format_repo_prompt(context)
     paths = context.get("changed_files") or []
@@ -968,12 +969,39 @@ def handle_chat_slash(text: str, agent: ConversationAgent, reload_client=None, c
         from scripts.mcp_client import ensure_default_user_mcp, get_registry
         ensure_default_user_mcp()
         reg = agent.mcp_registry() if hasattr(agent, 'mcp_registry') else get_registry()
+        def confirm_server(server):
+            info = reg.trust_info(server)
+            if info.get('error'):
+                print(warn(info['error']))
+                return False
+            if info.get('trusted'):
+                return True
+            print(warn('此操作会运行本地 MCP 程序，可按当前账户权限访问文件；只读工具声明不是沙箱。'))
+            print(mute('程序: ' + json.dumps([info['command'], *info['args']], ensure_ascii=False)))
+            print(mute('实际路径: ' + str(info.get('executable') or '(未找到)')))
+            print(mute('显式环境变量: ' + ', '.join(info.get('env_keys') or [])))
+            try:
+                answer = input('信任此配置并启动？输入 y 确认: ').strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = ''
+            if answer not in ('y', 'yes', '是'):
+                print(mute('已取消，未启动 MCP 程序。'))
+                return False
+            try:
+                trusted = reg.trust(server, info['fingerprint'])
+            except OSError:
+                trusted = False
+            if not trusted:
+                print(warn('MCP 配置已变化或信任保存失败，请重新确认。'))
+                return False
+            return True
+
         parts = arg.split(None, 2)
         sub = (parts[0] if parts else '').lower()
         if not sub or sub in ('list', 'ls'):
             print(ok('MCP servers（内置 ascend-doc = 昇腾文档）'))
             for s in reg.list_servers():
-                flag = 'disabled' if s.get('disabled') else 'on'
+                flag = 'disabled' if s.get('disabled') else ('trusted' if s.get('trusted') else '需确认')
                 desc = s.get('description') or ''
                 print(mute(f"  • {s['name']} [{flag}] {s.get('command')} {' '.join(s.get('args') or [])}"))
                 if desc:
@@ -985,6 +1013,8 @@ def handle_chat_slash(text: str, agent: ConversationAgent, reload_client=None, c
             print(ok('已重载 MCP 配置'))
             return 'handled'
         if sub == 'tools' and len(parts) >= 2:
+            if not confirm_server(parts[1]):
+                return 'handled'
             info = reg.list_tools(parts[1])
             if info.get('error'):
                 print(warn(info['error']))
@@ -1011,6 +1041,8 @@ def handle_chat_slash(text: str, agent: ConversationAgent, reload_client=None, c
             print(mute(f'MCP call {server}/{tool} …'))
             if not isinstance(args_obj, dict):
                 print(warn('arguments 必须是 JSON 对象'))
+                return 'handled'
+            if not confirm_server(server):
                 return 'handled'
             result = reg.call(server, tool, args_obj)
             print(json.dumps(result, ensure_ascii=False, indent=2)[:8000])
@@ -1418,7 +1450,7 @@ def main() -> int:
     review_parser.add_argument("--json", action="store_true", help="输出 JSON")
     review_parser.add_argument("--max-diff", type=int, default=12000)
     review_parser.add_argument("--require-full", action="store_true",
-                               help="diff 超出 --max-diff 时直接失败，不给出只覆盖部分改动的审查结果")
+                               help="diff 截断或包含未提供内容的二进制文件时直接失败")
     review_parser.add_argument("--scenario", choices=["operator", "inference", "opengauss"],
                                help="加载专业 Agent：operator=算子，inference=推理，opengauss=openGauss 社区；省略则自动判定")
     review_parser.add_argument("--require-scenario", action="store_true",

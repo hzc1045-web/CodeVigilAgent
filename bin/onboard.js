@@ -1,8 +1,7 @@
 /**
  * First-run API setup wizard (Claude Code–style guided onboarding).
  */
-const fs = require('fs');
-const { homeDir, configPath, readConfig, c, boxen, spinner, sleep, tf, frameCard } = require('./ui');
+const { configPath, readConfig, writeConfig: saveConfig, c, boxen, spinner, sleep, tf, frameCard } = require('./ui');
 const { react } = require('./buddy');
 
 let inquirer;
@@ -271,19 +270,9 @@ const PROVIDERS = [
   },
 ];
 
-function ensureHome() {
-  const home = homeDir();
-  if (!fs.existsSync(home)) fs.mkdirSync(home, { recursive: true });
-  return home;
-}
-
 function writeConfig(data) {
-  ensureHome();
-  const target = configPath();
   const prev = readConfig() || {};
-  const next = { ...prev, ...data };
-  fs.writeFileSync(target, `${JSON.stringify(next, null, 2)}\n`, 'utf8');
-  return target;
+  return saveConfig({ ...prev, ...data });
 }
 
 /** Native adapters vs OpenAI-compatible HTTP (need base_url). */

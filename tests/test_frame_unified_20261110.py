@@ -184,13 +184,16 @@ class NodeParityTests(unittest.TestCase):
 
         规则改了却忘了重跑生成器 → Node 和 Python 的宽度会悄悄分家。
         """
-        gen = ROOT / 'scripts' / 'gen_width_table.py'
-        r = subprocess.run([sys.executable, str(gen)], cwd=str(ROOT),
-                           capture_output=True, text=True, timeout=180)
-        self.assertEqual(r.returncode, 0, r.stderr)
-        # 生成器直接覆盖原文件，跑完对比 git 里的版本是否变化由人判断；
-        # 这里至少保证生成过程中断言的段数合理、文件非空。
-        text = (ROOT / 'bin' / 'width-table.js').read_text(encoding='utf-8')
+        import contextlib
+        import io
+        import tempfile
+        from unittest.mock import patch
+        from scripts import gen_width_table
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'width-table.js'
+            with patch.object(gen_width_table, 'OUT', target), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(gen_width_table.main(), 0)
+            text = target.read_text(encoding='utf-8')
         self.assertIn('WIDE:', text)
         self.assertIn('AMBIGUOUS:', text)
         self.assertGreater(len(text), 1000)

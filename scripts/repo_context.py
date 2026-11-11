@@ -73,7 +73,7 @@ def collect_repo_context(
     root = Path(_run_git(repo, "rev-parse", "--show-toplevel").strip()).resolve()
     branch = _run_git(root, "branch", "--show-current").strip() or "(detached)"
     status = _run_git(root, "status", "--short", max_output=4000)
-    diff_args = ["diff", "--no-ext-diff", "--unified=3"]
+    diff_args = ["diff", "--no-ext-diff", "--no-textconv", "--unified=3"]
     if staged:
         diff_args.insert(1, "--cached")
     full_diff = _run_git(root, *diff_args)
@@ -83,6 +83,13 @@ def collect_repo_context(
     if staged:
         file_args.append("--cached")
     changed_files: List[str] = [name for name in _run_git(root, *file_args).split('\0') if name]
+    stat_args = ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "--no-renames", "-z"]
+    if staged:
+        stat_args.append("--cached")
+    unreviewed_files = []
+    for row in _run_git(root, *stat_args).split('\0'):
+        if row.startswith('-\t-\t'):
+            unreviewed_files.append(row.split('\t', 2)[2])
     untracked = _run_git(root, 'ls-files', '--others', '--exclude-standard', '-z').split('\0')
     untracked = [name for name in untracked if name]
 
@@ -96,6 +103,23 @@ def collect_repo_context(
         "diff_truncated": len(full_diff) > max_diff_chars,
         "diff_total_chars": len(full_diff),
         "untracked_files": untracked,
+        "unreviewed_files": unreviewed_files,
+    }
+
+
+def review_coverage(context: Dict) -> Dict:
+    """Describe missing review content independently of the model's verdict."""
+    notes = []
+    if context.get('diff_truncated'):
+        notes.append(f"diff 被截断，只提供 {len(context.get('diff', ''))} / "
+                     f"{context.get('diff_total_chars', '?')} 字符")
+    unreviewed = context.get('unreviewed_files') or []
+    if unreviewed:
+        notes.append('未提供二进制文件内容: ' + ', '.join(unreviewed))
+    return {
+        'coverage': 'partial' if notes else 'full',
+        'coverage_note': '；'.join(notes),
+        'unreviewed_files': unreviewed,
     }
 
 
@@ -110,6 +134,9 @@ def format_repo_prompt(context: Dict) -> str:
             "只能对已提供部分下结论；不得把未提供的改动当作没有问题，"
             "也不得因为已看到的部分没有问题就给出 approve。\n"
         )
+    if context.get('unreviewed_files'):
+        scope += ('\n【审查范围警告】' + review_coverage(context)['coverage_note'] +
+                  '。只能评价已提供内容，不得给整个改动 approve。\n')
     return f"""Git PR diff 审查任务。只根据下面的 diff 指出可证实的问题；不要把状态列表当成代码内容。
 diff 中以 "-" 开头的行是已删除的代码，只有 "+" 开头的行才是改动后的代码；不要把删除行当作现有问题。{scope}
 仓库上下文:

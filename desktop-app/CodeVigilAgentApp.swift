@@ -356,8 +356,8 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         // NSTextView 放进 NSScrollView 时必须显式声明「宽跟随、高自由」。
         // 不声明的话 textContainer 宽度可能是 0，文字会被挤成一列、互相重叠。
         outputView.minSize = NSSize(width: 0, height: 0)
-        outputView.maxSize = NSSize(width: .greatestFiniteMagnitude,
-                                    height: .greatestFiniteMagnitude)
+        outputView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                    height: CGFloat.greatestFiniteMagnitude)
         outputView.isVerticallyResizable = true
         outputView.isHorizontallyResizable = false
         outputView.autoresizingMask = [.width]

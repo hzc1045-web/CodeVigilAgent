@@ -21,7 +21,7 @@ project_root = Path(__file__).resolve().parent
 sys.path.insert(0, str(project_root))
 
 try:
-    from scripts.smart_reviewer import SmartReviewer
+    from scripts.smart_reviewer import SmartReviewer, validate_ai_result
     from scripts.ai_adapter import get_ai_client
     from scripts.repo_context import RepoContextError, collect_repo_context, format_repo_prompt
 except ImportError as e:
@@ -87,6 +87,18 @@ def cmd_review(args):
         'source': 'git' if repo_context else ('file' if args.file else 'text'),
         'repository': repo_context,
     })
+    if not isinstance(report, dict):
+        report = {'review_result': {'error': '审查器没有返回有效报告'}}
+    result = report.get('review_result')
+    if not isinstance(result, dict):
+        result = report['review_result'] = {'error': '缺少有效的审查结果'}
+    if not result.get('error'):
+        try:
+            validate_ai_result(result)
+        except ValueError as exc:
+            result['error'] = str(exc)
+    failed = bool(result.get('error'))
+    report['status'] = 'error' if failed else 'complete'
 
     # 输出报告
     if args.output:
@@ -99,7 +111,7 @@ def cmd_review(args):
     if not args.quiet:
         reviewer.print_report(report)
 
-    return 0
+    return 1 if failed else 0
 
 
 def cmd_test(args):
@@ -115,6 +127,8 @@ def cmd_test(args):
 
 def cmd_config(args):
     """配置命令"""
+    from scripts.agent_home import write_config
+
     config_file = args.config or 'config/ai_config.json'
 
     if args.show:
@@ -153,10 +167,7 @@ def cmd_config(args):
                 "model": "deepseek-chat"
             }
 
-        os.makedirs(os.path.dirname(config_file), exist_ok=True)
-
-        with open(config_file, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+        write_config(config, config_file)
 
         print(f"[OK] 配置文件已创建: {config_file}")
         print(f"[INFO] 请编辑文件并填入你的 API Key")
@@ -176,8 +187,7 @@ def cmd_config(args):
 
         config[key] = value
 
-        with open(config_file, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+        write_config(config, config_file)
 
         print(f"[OK] 已设置: {key} = {value}")
 

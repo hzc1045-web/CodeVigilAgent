@@ -1,16 +1,18 @@
 """Minimal MCP stdio client (tools only) for ReviewAgent.
 
-Default built-in server: ascend-doc (npx -y ascend-doc-mcp@latest),
-matching Ascend agent-skills docs/doc-mcp/README.md.
+The registry requires user trust before starting a server. This is a process
+permission boundary, not a filesystem sandbox.
 """
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
 import queue
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -23,10 +25,15 @@ from scripts.knowledge_search import PROJECT_ROOT
 BUILTIN_SERVERS = {
     'ascend-doc': {
         'command': 'npx',
-        'args': ['-y', 'ascend-doc-mcp@latest'],
+        'args': ['-y', 'ascend-doc-mcp@1.0.1'],
         'description': '昇腾官方只读文档 MCP（ascend-doc-mcp）',
     },
 }
+
+# Only launcher/runtime essentials. Service credentials must be explicit in env.
+PROCESS_ENV_KEYS = ('PATH', 'HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH',
+                    'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT',
+                    'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE')
 
 
 @dataclass
@@ -47,6 +54,18 @@ class McpServerConfig:
             'description': self.description,
             'builtin': self.name in BUILTIN_SERVERS,
         }
+
+
+def _executable(config: McpServerConfig) -> str:
+    path = config.env.get('PATH', os.environ.get('PATH', os.defpath))
+    return shutil.which(config.command, path=path) or config.command
+
+
+def _fingerprint(config: McpServerConfig) -> str:
+    payload = {'command': config.command, 'executable': _executable(config), 'cwd': str(Path.cwd()),
+               'args': config.args, 'env': config.env}
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode('utf-8')
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _parse_servers_block(raw: Dict) -> Dict[str, Dict]:
@@ -134,7 +153,7 @@ def ensure_default_user_mcp() -> Path:
         'mcpServers': {
             'ascend-doc': {
                 'command': 'npx',
-                'args': ['-y', 'ascend-doc-mcp@latest'],
+                'args': list(BUILTIN_SERVERS['ascend-doc']['args']),
                 'description': '昇腾官方只读文档 MCP',
             }
         }
@@ -165,12 +184,12 @@ class McpSession:
         if self.config.disabled:
             self.last_error = 'server disabled'
             return False
-        executable = shutil.which(self.config.command)
-        if self.config.command == 'npx' and not executable:
+        executable = _executable(self.config)
+        if self.config.command == 'npx' and executable == 'npx':
             self.last_error = '未找到 npx（需 Node.js ≥ 22 以运行 ascend-doc-mcp）'
             return False
         cmd = [executable or self.config.command, *self.config.args]
-        env = os.environ.copy()
+        env = {key: value for key, value in os.environ.items() if key.upper() in PROCESS_ENV_KEYS}
         env.update(self.config.env)
         try:
             self.proc = subprocess.Popen(
@@ -383,13 +402,61 @@ class McpRegistry:
         self._sessions.clear()
 
     def list_servers(self) -> List[Dict]:
-        return [c.as_dict() for c in self.configs.values()]
+        return [{**c.as_dict(), 'trusted': self.is_trusted(c.name)} for c in self.configs.values()]
+
+    def is_trusted(self, name: str) -> bool:
+        cfg = self.configs.get(name)
+        if not cfg or cfg.disabled:
+            return False
+        trusted = _load_json_file(Path(home_dir()) / 'mcp-trust.json')
+        return trusted.get(name) == _fingerprint(cfg)
+
+    def trust_info(self, name: str) -> Dict:
+        cfg = self.configs.get(name)
+        if not cfg:
+            return {'error': f'未知 MCP server: {name}'}
+        if cfg.disabled:
+            return {'error': f'MCP server 已禁用: {name}'}
+        return {**cfg.as_dict(), 'executable': _executable(cfg),
+                'env_keys': sorted(cfg.env), 'fingerprint': _fingerprint(cfg),
+                'trusted': self.is_trusted(name)}
+
+    def trust(self, name: str, fingerprint: str) -> bool:
+        """Persist only the exact configuration the user just confirmed."""
+        cfg = self.configs.get(name)
+        if not cfg or cfg.disabled or _fingerprint(cfg) != fingerprint:
+            return False
+        root = Path(ensure_home())
+        path = root / 'mcp-trust.json'
+        trusted = _load_json_file(path)
+        trusted[name] = fingerprint
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=root,
+                                             prefix='.mcp-trust-', delete=False) as stream:
+                temporary = Path(stream.name)
+                os.chmod(temporary, 0o600)
+                json.dump(trusted, stream, ensure_ascii=False, indent=2)
+                stream.write('\n')
+            os.replace(temporary, path)
+        finally:
+            if temporary and temporary.exists():
+                temporary.unlink()
+        return True
 
     def get_session(self, name: str, start: bool = True) -> Optional[McpSession]:
         cfg = self.configs.get(name)
         if not cfg:
             return None
         sess = self._sessions.get(name)
+        if not self.is_trusted(name):
+            if sess:
+                sess.close()
+                self._sessions.pop(name, None)
+            denied = McpSession(cfg)
+            denied.last_error = ('MCP server 已禁用' if cfg.disabled else
+                                 f'MCP 进程尚未获信任；请先用 /mcp tools {name} 确认命令权限')
+            return denied if start else None
         if sess and sess.proc and sess.proc.poll() is None:
             return sess
         if not start:

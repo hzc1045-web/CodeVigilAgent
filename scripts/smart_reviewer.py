@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scripts.ai_adapter import get_ai_client
 from scripts.knowledge_search import KnowledgeSearch, PROJECT_ROOT
-from scripts.repo_context import decode_git_path
+from scripts.repo_context import decode_git_path, review_coverage
 
 _HUNK_HEADER = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@')
 SEVERITIES = ('critical', 'high', 'medium', 'low')
@@ -540,15 +540,10 @@ class SmartReviewer:
                 ).strip('；')
         repository = (metadata or {}).get('repository')
         if repository and isinstance(review_result, dict):
-            truncated = bool(repository.get('diff_truncated'))
-            review_result['coverage'] = 'partial' if truncated else 'full'
-            if truncated:
+            review_result.update(review_coverage(repository))
+            if review_result['coverage'] == 'partial':
                 if review_result.get('recommendation') == 'approve':
                     review_result['recommendation'] = 'comment'
-                review_result['coverage_note'] = (
-                    f"diff 被截断，只审查了 {len(repository.get('diff', ''))} / "
-                    f"{repository.get('diff_total_chars', '?')} 字符；结果不代表整个改动。"
-                )
         if verbose:
             print()
 

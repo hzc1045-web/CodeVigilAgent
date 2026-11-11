@@ -128,7 +128,7 @@ class SessionSkillTests(unittest.TestCase):
     def test_names_with_spaces_resume_and_reserved_names_cannot_overwrite_aliases(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'REVIEWAGENT_HOME': tmp}):
             path = save_session(agent(), 'my project')
-            self.assertEqual(Path(load_session('my project')['_path']), path)
+            self.assertEqual(Path(load_session('my project')['_path']), path.resolve())
             previous = path.read_bytes()
             for name in ('123', 'previous', 'latest', 'back'):
                 with self.subTest(name=name), self.assertRaises(ValueError):

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -31,10 +30,19 @@ def project_config_path() -> Path:
 
 def ensure_home() -> Path:
     root = home_dir()
-    root.mkdir(parents=True, exist_ok=True)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    root.chmod(0o700)
     cfg = config_path()
     if not cfg.exists() and TEMPLATE.exists():
-        shutil.copy2(TEMPLATE, cfg)
+        try:
+            fd = os.open(str(cfg), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass  # Another CLI process created the first-run config.
+        else:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(TEMPLATE.read_bytes())
+    if cfg.exists():
+        cfg.chmod(0o600)
     return root
 
 
@@ -66,9 +74,13 @@ def read_config(path: Optional[str] = None) -> dict:
 
 def write_config(data: dict, path: Optional[str] = None) -> Path:
     ensure_home()
-    target = Path(path) if path else config_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with open(target, 'w', encoding='utf-8') as f:
+    target = Path(path).expanduser() if path else config_path()
+    # Explicit configs may live in a shared directory; only protect the file there.
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if target.exists():
+        target.chmod(0o600)
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write('\n')
     return target

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Tuple
 
-from scripts.repo_context import RepoContextError, collect_repo_context, format_repo_prompt
+from scripts.repo_context import RepoContextError, collect_repo_context, format_repo_prompt, review_coverage
 from scripts.smart_reviewer import SmartReviewer
 from scripts.specialist_context import resolve_specialist
 
@@ -31,11 +31,9 @@ def run_local_review(
         return tip + ' 可先 `git add`，或使用 `/review staged`。', {}
 
     warn = ''
-    if context.get('diff_truncated'):
-        warn = (
-            f"\n\n> 注意: diff 共 {context.get('diff_total_chars')} 字符，"
-            f"已截断到 {max_diff}（coverage=partial）。\n"
-        )
+    coverage = review_coverage(context)
+    if coverage['coverage'] == 'partial':
+        warn = f"\n\n> 注意: {coverage['coverage_note']}（coverage=partial）。\n"
 
     prompt = format_repo_prompt(context)
     paths = context.get('changed_files') or []

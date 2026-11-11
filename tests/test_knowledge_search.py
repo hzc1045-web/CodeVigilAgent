@@ -89,7 +89,7 @@ class KnowledgeTests(unittest.TestCase):
                 ['node', str(PROJECT_ROOT / 'bin/review.js'), 'review', '--offline', '--json'],
                 cwd=self.root, capture_output=True, text=True, encoding='utf-8', check=True)
             wrapped_report = json.loads(wrapped.stdout)
-            self.assertEqual(Path(wrapped_report['metadata']['repository']['root']), self.root)
+            self.assertEqual(Path(wrapped_report['metadata']['repository']['root']), self.root.resolve())
             self.assertEqual(wrapped_report['metadata']['repository']['changed_files'], ['model.py'])
 
 

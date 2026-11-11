@@ -166,7 +166,7 @@ class ChatReviewRegressionTests(unittest.TestCase):
                 patch('scripts.smart_reviewer.get_ai_client', side_effect=ValueError('no ai')), \
                 patch('scripts.smart_reviewer.KnowledgeSearch', Silent):
             _, report = run_local_review(path=root)
-            self.assertEqual(Path(report['metadata']['repository']['root']), root)
+            self.assertEqual(Path(report['metadata']['repository']['root']), root.resolve())
             self.assertEqual(report['engine'], 'rules')
 
     def test_slash_review_and_status_use_active_session(self):
