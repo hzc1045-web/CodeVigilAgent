@@ -14,7 +14,7 @@ rem
 rem  换回正常模式：双击 start-reviewagent.bat
 rem ============================================================
 
-cd /d "%~dp0"
+cd /d "%~dp0.."
 set "REVIEWAGENT_RENDER=pad"
 
 echo.

@@ -7,7 +7,7 @@ bash desktop-app/build-mac.sh
 codesign --verify --deep --strict desktop-app/build/CodeVigilAgent.app
 ```
 
-构建只复制受控运行路径中 Git 跟踪或非忽略的 Python、规则 Markdown、知识库 JSON 和配置模板。不复制真实配置、`.env`、会话、旧发布包或符号链接。修改了运行文件但尚未提交时也会复制实际内容；`Contents/Resources/build-manifest.json` 记录版本、来源提交、工作区是否有改动、每个后端文件及 Swift/构建脚本的 SHA-256。发布前核对这些值对应本次测试源码。
+构建只复制受控运行路径中 Git 跟踪或非忽略的 Python（含 `scripts/cli_commands/` 等子包）、规则 Markdown、知识库 JSON 和配置模板。不复制真实配置、`.env`、会话、旧发布包或符号链接。修改了运行文件但尚未提交时也会复制实际内容；`Contents/Resources/build-manifest.json` 记录版本、来源提交、工作区是否有改动、每个后端文件及 Swift/构建脚本的 SHA-256。发布前核对这些值对应本次测试源码。
 
 包内后端用于桌面的对话、审查、会话和案例检索；不包含旧 `chat.py` / `chat_v2.py` 入口、Node 命令行界面或开发测试。依赖旧入口的终端边框诊断 `scripts.frame_doctor` 应在完整源码目录运行。
 

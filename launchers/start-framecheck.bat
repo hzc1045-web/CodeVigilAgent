@@ -1,8 +1,8 @@
 @echo off
 chcp 65001>nul
 title ReviewAgent - Frame Check
-rem %~dp0 = the folder this .bat lives in, so the repo can be cloned anywhere.
-cd /d "%~dp0"
+rem %~dp0 = this .bat's folder (launchers\); %~dp0.. = repo root.
+cd /d "%~dp0.."
 
 rem ============================================================
 rem  Border check ONLY. No API key needed, no network.

@@ -1,0 +1,194 @@
+# 架构说明
+
+> 这份文档回答两个问题：**东西都放在哪**、**加新功能该动哪里**。
+>
+> 背景：评审反馈「整体结构上有点拥挤，如果后面加新的功能会影响」。
+> 本文记录针对这条反馈做的结构调整，以及**故意没动**的部分（附原因）。
+
+---
+
+## 一、原来拥挤在哪
+
+| 位置 | 问题 |
+|------|------|
+| 仓库根目录 | 30+ 项：9 份文档、11 个 `.bat`、6 个根 `.py`，其中 3 个是已失效的旧入口 |
+| `desktop-app/win/app.py` | 383 行、**一个类**同时管布局、按钮、子进程、配置读写、设置对话框 |
+| 桌面版操作行 | 5 个按钮挤在一排，再加功能只能继续往右排 |
+| `chat_v2.py` | 1008 行，颜色/字形/盒子绘制（约 240 行）和对话流程混在一个文件 |
+
+结论：不是"文件多"，而是**职责边界不清**——改一处要动同一个文件，加功能必然互相影响。
+
+---
+
+## 二、现在的分层
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ 入口层   启动脚本 → app.py / ascend_cli.py / bin/*.js         │
+│          只做参数解析与启动，不放业务逻辑                      │
+├──────────────────────────────────────────────────────────────┤
+│ 编排层   cvapp.shell（桌面版窗口骨架）                        │
+│          ascend_cli 的命令函数（review / chat / doctor ...）   │
+│          决定"先做什么、再做什么"                             │
+├──────────────────────────────────────────────────────────────┤
+│ 能力层   cvapp.runner（子进程）  cvapp.features（功能）        │
+│          scripts.smart_reviewer（审查） scripts.github_fetcher │
+│          一个能力只做一件事，可单独测试                        │
+├──────────────────────────────────────────────────────────────┤
+│ 基础层   cvapp.theme / cvapp.widgets / scripts.term_ui         │
+│          scripts.term_frame / scripts.console_safe / config    │
+│          颜色、字体、宽度、编码、配置                          │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**依赖方向只能从上往下。** 基础层不允许 import 编排层，能力层不允许认识界面。
+这样换界面（终端 ↔ 桌面）不用改业务，改业务不用动界面。
+
+---
+
+## 三、目录职责
+
+| 路径 | 职责 | 加功能时会动到吗 |
+|------|------|-----------------|
+| `ascend_cli.py` | CLI 入口与命令编排（测试的 patch 接缝） | 加子命令时会 |
+| `chat_v2.py` | 终端对话流程 | 加对话能力时会 |
+| `scripts/term_ui.py` | 终端颜色 / 字形 / 盒子绘制 | 一般不动 |
+| `scripts/term_frame.py` | **宽度计算的唯一出处**（定位渲染 + 补空格兜底） | 一般不动 |
+| `scripts/smart_reviewer.py` | 审查主流程 | 加审查规则时会 |
+| `scripts/custom_commands.py` | 自定义斜杠命令（读 `.reviewagent/commands`） | 一般不动 |
+| `scripts/file_mentions.py` | `@文件` 引用解析与安全边界 | 一般不动 |
+| `scripts/git_hooks.py` | pre-commit 钩子安装/卸载 | 一般不动 |
+| `scripts/usage_meter.py` | `/cost` 用量估算 | 一般不动 |
+| `scripts/cli_commands/` | 斜杠命令注册表：新命令加文件，不改入口 | 加内置命令时 |
+| `scripts/system_open.py` `clipboard.py` `config_backup.py` | 打开目录 / 剪贴板 / 配置备份 | 一般不动 |
+| `scripts/model_catalog.py` | 厂商与模型清单的唯一出处（CLI `model --list` 的 CATALOG） | 加模型时只改这里 |
+| `scripts/model_choices.py` | 下拉选项的纯逻辑（选厂商 / 选模型 / 自定义降级），CLI 与桌面共用 | 一般不动 |
+| `tests/test_structure_guard.py` | 结构守卫：行数预算、分层、注册表约定 | 调预算时 |
+| `desktop-app/win/app.py` | 桌面版入口，20 行 | 不动 |
+| `desktop-app/win/cvapp/shell.py` | 窗口骨架：侧边栏 + 工作区 | 一般不动 |
+| `desktop-app/win/cvapp/features/` | **桌面版功能注册表** | 加桌面功能只动这里 |
+| `desktop-app/win/cvapp/theme.py` | 颜色 / 字体 / 尺寸唯一来源 | 改配色时 |
+| `desktop-app/CodeVigilAgentApp.swift` | macOS 版（SwiftUI），模型下拉复用 CLI `model --list --json` | 改 Mac 界面时 |
+| `bin/` | Node 层 CLI（`reviewagent` 命令） | 加 npm 子命令时会 |
+| `launchers/` | 次要启动脚本 | 不动 |
+| `legacy/` | 已退役入口，只留档 | 不动 |
+| `tests/` | 回归测试（394 项 Python + 9 项 JS） | 每次加功能都要加 |
+
+---
+
+## 四、桌面版的扩展点（重点）
+
+原来的操作行：
+
+```
+[审查当前改动] [离线审查] [模型设置] [取消] [清空输出]
+```
+
+现在是**左侧分组侧边栏**，每组下面都留了空间：
+
+```
+功能
+├── 审查        ← 加审查类功能放这里
+│   ├── 审查当前改动   F5
+│   └── 离线审查       Shift+F5
+├── 输出        ← 加输出/导出类功能放这里
+│   ├── 清空输出       Ctrl+L
+│   └── 取消任务       Esc
+└── 系统        ← 加设置/关于类功能放这里
+    └── 模型设置       Ctrl+,
+```
+
+加一个功能 = **在 `cvapp/features/` 新建一个文件**，不需要改布局、不需要改 shell、不需要在别处登记：
+
+```python
+# cvapp/features/export.py
+from .base import Feature
+
+def export_markdown(app):
+    ...
+
+FEATURES = [
+    Feature(id='export.md', group='输出', label='导出 Markdown',
+            handler=export_markdown, order=30),
+]
+```
+
+程序启动时用 `pkgutil` 自动发现该目录下所有模块并读取 `FEATURES`。
+一个模块导入失败只会被跳过并显示在状态栏，不会拖垮整个窗口。
+
+详见 [ADDING-FEATURES.md](ADDING-FEATURES.md)。
+
+### 不改代码的扩展点
+
+用户侧还有三个「连 Python 都不用改」的入口：
+
+| 扩展点 | 加什么 | 怎么加 |
+|--------|--------|--------|
+| `.reviewagent/commands/*.md` | 自定义斜杠命令（`/并发`、`/报错`…） | 放一个 Markdown，`/commands` 立即可见；正文可用 `$ARGUMENTS` |
+| 消息里的 `@路径` | 把仓库文件内容带进对话 | 直接写 `@src/a.py`；只允许仓库内、单文件 ≤64 KB、每次 ≤8 个 |
+| `install-hook` | 提交前自动离线审查 | `python ascend_cli.py install-hook --severity high`；`--fail-on` 控制退出码 |
+| `scripts/cli_commands/*.py` | 内置斜杠命令（`/copy`、`/dir`…） | 新建文件写 `COMMANDS = {'/名字': 函数}`，自动发现；**不要改 `handle_chat_slash()`** |
+
+会话用量用 `/cost` 查看（字符级估算，不报金额）。
+
+### 结构守卫（让「拥挤」在测试里失败）
+
+`tests/test_structure_guard.py` 把评审的担心变成可执行规则：
+
+| 规则 | 作用 |
+|------|------|
+| 关键文件行数预算 | `ascend_cli.py` 等超预算就红，必须拆模块或显式调预算 |
+| `handle_chat_slash` 函数预算 | 禁止继续往同一个函数堆命令，新命令走注册表 |
+| 分层方向 | `scripts/` 不许 import `ascend_cli`，桌面层不许依赖 CLI 入口 |
+| 注册表约定 | `cli_commands/` 下每个模块必须声明 `COMMANDS` |
+| 根目录文件数 ≤20 | 防止文件重新堆回根目录 |
+
+超预算时的正确做法：先拆模块；确实要加，再改预算数字，并在提交信息里写理由。
+
+---
+
+## 五、故意没动的地方
+
+重构的原则是「只移动，不改逻辑」。以下三处评估后**保留原样**：
+
+| 位置 | 为什么不动 |
+|------|-----------|
+| `ascend_cli.py`（1510 行） | 286 项测试里有 50+ 处 `patch('ascend_cli.read_config')` 之类的补丁，它就是这个项目的**测试接缝**。拆成包会让补丁打在别的命名空间上，测试全红，而收益只是行数变少。 |
+| `review_cli.py`（331 行） | 文档里被引用 56 次，是公开命令。移走会让大量文档失效。 |
+| `chat_v2.py` 的 `ReviewAgentChat` | 拆出样式层后剩 768 行，剩下的是**高内聚**的对话流程（会话、斜杠命令、流式输出），继续切只会让人更难找代码。 |
+
+> 判断标准来自 `pc-code-refactor` 技能：**按职责拆分，不按行数拆分**；
+> 一个有凝聚力的 600 行文件，好过三个各 200 行但乱切的文件。
+
+---
+
+## 六、行为等价清单（重构后必须不变的）
+
+桌面版重构只换结构，以下全部保持：
+
+- 启动方式：`app.py` 仍是入口，双击 `启动桌面版.bat` / 桌面快捷方式不受影响
+- 子进程参数：`review`、`review --offline`、`chat --message ... --network auto`
+- 环境变量：`REVIEWAGENT_RENDER=pad`、`PYTHONIOENCODING=utf-8`、`PYTHONPATH=仓库根`
+- 配置路径：`~/.reviewagent/ai_config.json`（与终端版共用）
+- 上次仓库：`desktop-app/win/last_repo.txt`
+- 字体策略：输出区仍用「新宋体」等 1:2 等宽字体
+- 退出码处理、取消行为、ANSI 着色
+
+---
+
+## 七、验证方式
+
+```bat
+:: 全量测试（约 2 分钟）
+python -m unittest discover -s tests
+
+:: JS 向导回退测试
+node tests\test_wizard_confirm.js
+
+:: CLI 冒烟
+python ascend_cli.py --version
+python ascend_cli.py doctor
+
+:: 桌面版（窗口应出现侧边栏）
+python desktop-app\win\app.py
+```

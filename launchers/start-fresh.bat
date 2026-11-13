@@ -20,7 +20,7 @@ rem not perfectly aligned (printed to stderr).
 set "REVIEWAGENT_FRAME_DEBUG=1"
 
 rem %~dp0 = the folder this .bat lives in.
-cd /d "%~dp0"
+cd /d "%~dp0.."
 
 rem Move the old fresh-home aside instead of deleting it.
 rem (never deletes anything; you can throw the .old folders away yourself)

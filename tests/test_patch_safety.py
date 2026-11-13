@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from scripts.patch_fix import FileEdit, ProposedFix, apply_fix, format_apply_result, parse_fix_json, preview_fix
 
@@ -118,6 +118,21 @@ class PatchSafetyTests(unittest.TestCase):
                 self.assertEqual(first.read_bytes(), b'old\r\n')
                 self.assertEqual(second.read_bytes(), bad_bytes)
                 self.assertFalse((self.root / 'new').exists())
+
+    def test_failed_apply_keeps_pending_fix_and_reports_failure(self):
+        from scripts.conversation_agent import ConversationAgent
+
+        target = self.root / 'first.py'
+        target.write_bytes(b'old')
+        agent = ConversationAgent(MagicMock(), MagicMock(), MagicMock(), network='off')
+        agent.work_root = self.root
+        fix = ProposedFix(files=[FileEdit('first.py', 'replace', 'missing', 'new')])
+        agent.pending_fix = fix
+        reply = agent.apply_pending_fix(confirm=True)
+        self.assertFalse(agent.last_ok)
+        self.assertIs(agent.pending_fix, fix)
+        self.assertIn('未写入任何文件', reply)
+        self.assertEqual(target.read_bytes(), b'old')
 
     def test_validation_io_error_and_unavailable_git_fail_closed(self):
         target = self.root / 'first.py'

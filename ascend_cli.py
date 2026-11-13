@@ -7,6 +7,7 @@ Model: env via cc-switch (OPENAI_* / ANTHROPIC_* / AI_*) or `reviewagent config`
 """
 
 import argparse
+import difflib
 import json
 import os
 import shlex
@@ -32,11 +33,23 @@ from scripts.term_style import (
 from scripts.think_ui import begin_think, end_think, think_progress
 from scripts.md_term import print_markdown_box
 from scripts.specialist_context import resolve_specialist
-from scripts.agent_home import ensure_home, resolve_config_file, config_path, home_dir, write_config, read_config
+from scripts.agent_home import (
+    ensure_home,
+    resolve_config_file,
+    resolve_existing_config,
+    config_path,
+    home_dir,
+    write_config,
+    read_config,
+)
 from scripts.model_catalog import (
+    active_model,
     apply_target_to_config,
+    catalog_payload,
     format_catalog_help,
+    format_catalog_list,
     gateway_changed,
+    print_catalog_json,
     resolve_model_request,
 )
 from scripts.session_store import (
@@ -55,12 +68,136 @@ from scripts.ci_log_analyzer import analyze_ci_log, format_ci_report
 from scripts.chat_review import run_local_review
 from scripts.context_compare import compare_contexts, format_compare_report
 from scripts import git_work
+from scripts.custom_commands import expand_command, find_command, load_commands
+from scripts.cli_commands import SlashContext, dispatch as dispatch_slash
+from scripts.file_mentions import expand as expand_mentions
+from scripts.git_hooks import HookError, SEVERITIES, install as install_hook, remove as remove_hook
+from scripts.report_markdown import render_markdown, write_markdown
+from scripts.usage_meter import UsageMeter
+from scripts.config_backup import backup_dir, create_backup, list_backups, restore_backup
+from scripts.system_open import open_path
+
+# 本次进程内的模型调用量（/cost 使用）；跨进程不持久化，够用且不引入状态文件
+_USAGE = UsageMeter()
 
 
 def _default_config(cli_value: str = None) -> str:
     if cli_value and cli_value not in ('unused.json',):
         return cli_value
     return resolve_config_file(None)
+
+
+def _agent_repo_root(agent=None) -> str:
+    """取 @文件引用 / 自定义命令的项目根。
+
+    优先级：桌面版显式选择的仓库 → Agent 的 work_root → 当前目录。
+    桌面版会把选中仓库放进 desktop_repository；不优先用它，
+    @文件就会去工具目录找，用户选仓库等于白选。
+    """
+    for attr in ('desktop_repository', 'work_root'):
+        root = getattr(agent, attr, None)
+        if root:
+            return str(root)
+    return os.getcwd()
+
+
+def _prepare_message(text: str, repo_root: str, quiet: bool = False) -> str:
+    """展开消息里的 @文件引用，并把附带/警告打印出来（JSON 模式保持静默）。"""
+    expanded, notes, warnings = expand_mentions(text, repo_root)
+    if not quiet:
+        for note in notes:
+            print(mute(f'  · {note}'))
+        for warning in warnings[:5]:
+            print(warn(f'  · {warning}'))
+    return expanded
+
+
+def _expand_once_message(text: str, repo_root: str) -> str:
+    """一次性 --message：支持 /自定义命令 与 @文件。内置斜杠命令不在这里处理。"""
+    if not text:
+        return text
+    if text.startswith('/'):
+        commands, warnings = load_commands(repo_root)
+        command, cmd_args = find_command(text, commands)
+        if command is not None:
+            for warning in warnings[:3]:
+                print(warn(f'  · {warning}'))
+            print(mute(f'▸ 自定义命令 /{command.name}（{command.source}）'))
+            text = expand_command(command, cmd_args)
+    return text
+
+
+def _severity_rank(value: str) -> int:
+    return {'low': 1, 'medium': 2, 'high': 3, 'critical': 4}.get(str(value or '').lower(), 0)
+
+
+def _print_repo_overview(context: dict) -> None:
+    """审查前打印仓库概览。数据全部来自 collect_repo_context，不重复跑 git。"""
+    branch = context.get('branch') or '(detached)'
+    changed = context.get('changed_files') or []
+    untracked = context.get('untracked_files') or []
+    print(f"[REPO] 当前分支: {branch}", flush=True)
+    print(f"[REPO] 改动文件: {len(changed)} 个", flush=True)
+    print(f"[REPO] 未跟踪文件: {len(untracked)} 个", flush=True)
+    if untracked:
+        # 重定向到文件时 stdout 有缓冲，不 flush 会和后面的输出乱序
+        print("[REPO] 未跟踪文件不参与审查。", flush=True)
+
+
+def _gate_exit_code(report: dict, threshold: str) -> int:
+    """--fail-on：有达到阈值的问题时返回 1，否则 0。"""
+    if not threshold or threshold == 'none':
+        return 0
+    result = report.get('review_result') if isinstance(report, dict) else None
+    issues = result.get('issues') if isinstance(result, dict) else None
+    if not isinstance(issues, list):
+        return 0
+    floor = _severity_rank(threshold)
+    hits = [i for i in issues if isinstance(i, dict) and _severity_rank(i.get('severity')) >= floor]
+    if hits:
+        print(f'[GATE] 发现 {len(hits)} 个 {threshold} 及以上问题，按 --fail-on 返回失败。',
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+def install_hook_cmd(args: argparse.Namespace) -> int:
+    repo = os.path.abspath(args.repo or '.')
+    try:
+        if args.remove:
+            path, action = remove_hook(repo)
+            print(f'[HOOK] {path}：{action}')
+            return 0
+        path, action = install_hook(
+            repo, python=sys.executable,
+            cli=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ascend_cli.py'),
+            severity=args.severity, force=args.force,
+        )
+    except HookError as exc:
+        print(f'[ERROR] {exc}')
+        return 1
+    print(f'[HOOK] {path}（{action}）')
+    print(f'  触发：git commit 时对暂存区跑离线审查，有 {args.severity} 及以上问题则阻止提交')
+    print('  卸载：python ascend_cli.py install-hook --remove')
+    return 0
+
+
+def open_cmd(args: argparse.Namespace) -> int:
+    """用系统默认程序打开常用目录，省得手动找路径。"""
+    target = (args.target or 'config').strip()
+    mapping = {
+        'config': Path(config_path()).parent,
+        'home': home_dir(),
+        'sessions': home_dir() / 'sessions',
+        'backups': backup_dir(),
+        'repo': Path(os.getcwd()),
+    }
+    path = mapping.get(target.lower())
+    if path is None:
+        path = Path(target).expanduser()
+    ok_open, detail = open_path(path)
+    print(('[OK] ' if ok_open else '[ERROR] ') + detail)
+    return 0 if ok_open else 1
 
 
 def sessions_cmd(args: argparse.Namespace) -> int:
@@ -116,6 +253,9 @@ def review(args: argparse.Namespace) -> int:
             print(f"[ERROR] {exc}")
         return 1
 
+    if not args.json:
+        _print_repo_overview(context)
+
     if not context["diff"].strip():
         message = ("暂存区没有可审查的 diff。" if args.staged else
                    "没有可审查的已跟踪文件 diff；未跟踪文件尚未纳入审查。")
@@ -135,6 +275,8 @@ def review(args: argparse.Namespace) -> int:
             }, ensure_ascii=False))
         else:
             print(f"[INFO] {message}")
+            if getattr(args, "report", None):
+                print("[INFO] 没有可审查的 diff，未生成 Markdown 报告。")
         return 0
     coverage = review_coverage(context)
     if coverage['coverage'] == 'partial':
@@ -247,7 +389,18 @@ def review(args: argparse.Namespace) -> int:
             reviewer.print_report(report)
     else:
         print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 1 if report_error or (isinstance(result, dict) and result.get("error")) else 0
+    if getattr(args, "report", None):
+        try:
+            destination = write_markdown(args.report, render_markdown(report, context))
+        except OSError as exc:
+            print(f"[ERROR] 无法写入 Markdown 报告 {args.report}: {exc}", file=sys.stderr)
+            return 1
+        print(f"[REPORT] Markdown 报告已保存: {destination}", file=sys.stderr)
+    code = 1 if report_error or (isinstance(result, dict) and result.get("error")) else 0
+    if code == 0:
+        # --fail-on：给 CI / pre-commit 用的质量门禁；默认 none 不改变既有行为
+        code = _gate_exit_code(report, getattr(args, "fail_on", "none"))
+    return code
 
 
 def test(args: argparse.Namespace) -> int:
@@ -411,6 +564,33 @@ def config_cmd(args: argparse.Namespace) -> int:
     path = Path(resolve_config_file(args.config if getattr(args, 'config', None) else None))
     if getattr(args, 'wizard', False):
         return _interactive_setup()
+    if getattr(args, 'backups', False):
+        rows = list_backups()
+        if not rows:
+            print(f'[INFO] 还没有备份（配置目录: {backup_dir()}）')
+            return 0
+        print(f'备份目录: {backup_dir()}')
+        for index, item in enumerate(rows, 1):
+            print(f'  {index:2d}. {item.name}  {item.stat().st_size} 字节')
+        print('\n恢复最近一份: ascend_cli.py config --restore')
+        return 0
+    if getattr(args, 'backup', False):
+        created = create_backup(path, tag='manual')
+        if created is None:
+            print(f'[INFO] 配置文件还不存在，无需备份: {path}')
+            return 0
+        print(f'[OK] 已备份: {created}')
+        return 0
+    if getattr(args, 'restore', None) is not None:
+        try:
+            source, safety = restore_backup(path, getattr(args, 'restore') or None)
+        except (OSError, ValueError) as exc:
+            print(f'[ERROR] 恢复失败: {exc}')
+            return 1
+        print(f'[OK] 已从 {source.name} 恢复 → {path}')
+        if safety:
+            print(f'[OK] 恢复前的配置已另存: {safety.name}')
+        return 0
     if args.init:
         ensure_home()
         print(f'[OK] home ready: {home_dir()}')
@@ -428,6 +608,8 @@ def config_cmd(args: argparse.Namespace) -> int:
         return 0
     if args.set:
         data = read_config(str(path)) or {}
+        # 改配置前自动留一份：写错 key 也能一条命令退回去
+        backup = create_backup(path, tag='auto')
         for item in args.set:
             if '=' not in item:
                 print(f'[ERROR] 期望 key=value，收到: {item}')
@@ -436,15 +618,42 @@ def config_cmd(args: argparse.Namespace) -> int:
             data[key.strip()] = value.strip()
         written = write_config(data, str(path))
         print(f'[OK] wrote {written}')
+        if backup:
+            print(f'[OK] 旧配置已备份: {backup.name}（config --restore 可回滚）')
         return 0
     return 0
 
 
 def model_cmd(args: argparse.Namespace) -> int:
-    """Show or switch model/provider (writes ~/.reviewagent/ai_config.json)."""
+    """Show, switch, or list model/provider (writes ~/.reviewagent/ai_config.json)."""
+    list_mode = bool(getattr(args, 'list', False))
+    if not list_mode and getattr(args, 'json', False):
+        print('[ERROR] --json 只能与 --list 一起使用', file=sys.stderr)
+        return 2
+    if list_mode and (args.provider or args.name or args.base_url):
+        # 列出清单是只读操作，和写入参数放一起语义不清，直接拒绝
+        print('[ERROR] --list 不能与 --provider / --name / --base-url 同时使用', file=sys.stderr)
+        return 2
+    if list_mode:
+        # 只读：不写配置、不建目录（resolve_existing_config 不会创建 home 模板）
+        active = active_model(resolve_existing_config(getattr(args, 'config', None)))
+        if getattr(args, 'json', False):
+            # 只输出 JSON：无提示行、无颜色码，便于桌面端直接 json.loads
+            print_catalog_json(active)
+        else:
+            print(format_catalog_list(catalog_payload(active)))
+        return 0
     ensure_home()
     path = str(config_path())
-    data = read_config(path) or {}
+    try:
+        data = read_config(path) or {}
+        if not isinstance(data, dict):
+            raise ValueError('配置顶层不是对象')
+    except (OSError, ValueError) as exc:
+        # 配置文件坏了：不覆盖、不打 traceback，让用户先备份/修复
+        print(f'[ERROR] 配置无法解析，未做任何修改：{path}（{exc}）', file=sys.stderr)
+        print('        可先备份或删除该文件，再运行 reviewagent config --init', file=sys.stderr)
+        return 1
     if args.provider:
         data['provider'] = args.provider
     if args.name:
@@ -965,91 +1174,6 @@ def handle_chat_slash(text: str, agent: ConversationAgent, reload_client=None, c
         print(mute('用法: /skill list | /skill load <名> | /skill install torch-npu-pr-review'))
         return 'handled'
 
-    if cmd == '/mcp':
-        from scripts.mcp_client import ensure_default_user_mcp, get_registry
-        ensure_default_user_mcp()
-        reg = agent.mcp_registry() if hasattr(agent, 'mcp_registry') else get_registry()
-        def confirm_server(server):
-            info = reg.trust_info(server)
-            if info.get('error'):
-                print(warn(info['error']))
-                return False
-            if info.get('trusted'):
-                return True
-            print(warn('此操作会运行本地 MCP 程序，可按当前账户权限访问文件；只读工具声明不是沙箱。'))
-            print(mute('程序: ' + json.dumps([info['command'], *info['args']], ensure_ascii=False)))
-            print(mute('实际路径: ' + str(info.get('executable') or '(未找到)')))
-            print(mute('显式环境变量: ' + ', '.join(info.get('env_keys') or [])))
-            try:
-                answer = input('信任此配置并启动？输入 y 确认: ').strip().lower()
-            except (EOFError, KeyboardInterrupt):
-                answer = ''
-            if answer not in ('y', 'yes', '是'):
-                print(mute('已取消，未启动 MCP 程序。'))
-                return False
-            try:
-                trusted = reg.trust(server, info['fingerprint'])
-            except OSError:
-                trusted = False
-            if not trusted:
-                print(warn('MCP 配置已变化或信任保存失败，请重新确认。'))
-                return False
-            return True
-
-        parts = arg.split(None, 2)
-        sub = (parts[0] if parts else '').lower()
-        if not sub or sub in ('list', 'ls'):
-            print(ok('MCP servers（内置 ascend-doc = 昇腾文档）'))
-            for s in reg.list_servers():
-                flag = 'disabled' if s.get('disabled') else ('trusted' if s.get('trusted') else '需确认')
-                desc = s.get('description') or ''
-                print(mute(f"  • {s['name']} [{flag}] {s.get('command')} {' '.join(s.get('args') or [])}"))
-                if desc:
-                    print(mute(f'      {desc}'))
-            print(mute('用法: /mcp tools <server> · /mcp call <server> <tool> [json] · /mcp reload'))
-            return 'handled'
-        if sub == 'reload':
-            reg.reload()
-            print(ok('已重载 MCP 配置'))
-            return 'handled'
-        if sub == 'tools' and len(parts) >= 2:
-            if not confirm_server(parts[1]):
-                return 'handled'
-            info = reg.list_tools(parts[1])
-            if info.get('error'):
-                print(warn(info['error']))
-            else:
-                print(ok(f"MCP tools · {info.get('server')}"))
-                for t in info.get('tools') or []:
-                    print(mute(f"  • {t.get('name')}: {t.get('description') or ''}"))
-                if not info.get('tools'):
-                    print(mute('（无工具或启动失败；ascend-doc 需要 Node ≥ 22 + npx）'))
-            return 'handled'
-        if sub == 'call' and len(parts) >= 3:
-            server = parts[1]
-            rest = parts[2].strip()
-            # tool [json-args]
-            bits = rest.split(None, 1)
-            tool = bits[0]
-            args_obj = {}
-            if len(bits) > 1:
-                try:
-                    args_obj = json.loads(bits[1])
-                except json.JSONDecodeError:
-                    print(warn('arguments 必须是 JSON 对象'))
-                    return 'handled'
-            print(mute(f'MCP call {server}/{tool} …'))
-            if not isinstance(args_obj, dict):
-                print(warn('arguments 必须是 JSON 对象'))
-                return 'handled'
-            if not confirm_server(server):
-                return 'handled'
-            result = reg.call(server, tool, args_obj)
-            print(json.dumps(result, ensure_ascii=False, indent=2)[:8000])
-            return 'handled'
-        print(mute('用法: /mcp | /mcp tools ascend-doc | /mcp call ascend-doc <tool> {} | /mcp reload'))
-        return 'handled'
-
     if cmd == '/help':
         print(brand('审核 / 质检怎么用'))
         print(ok('0) AI自动调换（默认）'))
@@ -1079,7 +1203,11 @@ def handle_chat_slash(text: str, agent: ConversationAgent, reload_client=None, c
         print(mute('   /commit /push /pr [draft] [标题]'))
         print(ok('6) 其它'))
         print(mute('   /status /history /retry /export /review /ci /checklist /compare'))
+        print(mute('   /copy 复制上一条回答 · /dir 打开仓库/配置/会话目录'))
         print(mute('   /save /resume /sessions clean · /new /back'))
+        print(mute('   自定义命令: /commands 查看；在 .reviewagent/commands 放 .md 即可新增'))
+        print(mute('   @文件 附带内容: 例如 "看下 @src/server.py 的锁"'))
+        print(mute('   用量: /cost（本次会话估算）'))
         print(mute('退出: exit / /exit / Ctrl+C（自动存会话）'))
         print(mute('/discard /context /sources /clear · /network auto|on|off'))
         return 'handled'
@@ -1088,8 +1216,48 @@ def handle_chat_slash(text: str, agent: ConversationAgent, reload_client=None, c
         print(warn('请在输入框使用该命令：/paste 进入多行，结束后 /send（或 /cancel）。'))
         return 'handled'
 
+    # 扩展命令：scripts/cli_commands/ 下的注册表。新命令应该加在那里，
+    # 而不是继续往这个函数里堆 if —— 内置命令优先，所以放在这里兜底。
+    if dispatch_slash(text, SlashContext(agent=agent,
+                                         repo_root=_agent_repo_root(agent),
+                                         usage=_USAGE)):
+        return 'handled'
+
+    # 自定义命令：项目级 .reviewagent/commands 或用户级 ~/.reviewagent/commands
+    # 放在内置命令之后判断，避免自定义命令抢占 /review、/model 等保留名。
+    repo_root = _agent_repo_root(agent)
+    commands, command_warnings = load_commands(repo_root)
+    command, command_args = find_command(text, commands)
+    if command is not None:
+        for warning in command_warnings[:3]:
+            print(warn(f'  · {warning}'))
+        prompt = _prepare_message(expand_command(command, command_args), repo_root)
+        print(mute(f'▸ 自定义命令 /{command.name}（{command.source}）'))
+        begin_think(f'/{command.name}')
+        try:
+            reply = agent.answer(prompt)
+        except Exception as exc:                       # noqa: BLE001
+            end_think('失败')
+            print(warn(f'执行失败: {exc}'))
+            return 'handled'
+        end_think('回答就绪')
+        _print_agent_reply(reply)
+        return 'handled'
+
     # Unknown slash — still "handled" so we don't send "/foo" to the model as a review
+    known = [
+        '/exit', '/quit', '/chat', '/work', '/mode', '/network', '/sources',
+        '/clear', '/status', '/history', '/export', '/copy', '/retry', '/new',
+        '/back', '/save', '/sessions', '/resume', '/review', '/ci', '/checklist',
+        '/compare', '/context', '/fix', '/apply', '/discard', '/git', '/commit',
+        '/push', '/pr', '/ship', '/model', '/skill', '/mcp', '/commands',
+        '/cost', '/dir', '/reveal', '/open', '/help', '/paste',
+    ]
+    known.extend('/' + item.name for item in commands.values())
+    close = difflib.get_close_matches(cmd, known, n=1, cutoff=0.6)
     print(warn(f'未知命令: {cmd}') + mute('  输入 /help 查看可用命令'))
+    if close:
+        print(mute(f'  你是不是想输入 {close[0]} ？'))
     return 'handled'
 
 
@@ -1152,11 +1320,11 @@ def chat(args: argparse.Namespace) -> int:
             else:
                 print(f"[ERROR] 无法恢复会话：{exc}")
             return 1
-        repository = getattr(args, 'repository', None)
-        if repository is not None:
-            agent.desktop_repository = str(Path(repository).expanduser().resolve()) if repository else ''
-        elif not hasattr(agent, 'desktop_repository'):
-            agent.desktop_repository = str(agent.work_root)
+    repository = getattr(args, 'repository', None)
+    if repository is not None:
+        agent.desktop_repository = str(Path(repository).expanduser().resolve()) if repository else ''
+    elif not hasattr(agent, 'desktop_repository'):
+        agent.desktop_repository = str(agent.work_root)
 
     def _reload_client(overrides=None):
         nonlocal client, agent
@@ -1177,6 +1345,9 @@ def chat(args: argparse.Namespace) -> int:
     if args.multiline:
         print(warn('已开启多行模式：回车换行，/send 发送，/cancel 取消。'))
     if args.message:
+        repo_root = _agent_repo_root(agent)
+        message = _expand_once_message(args.message, repo_root)
+        message = _prepare_message(message, repo_root, quiet=getattr(args, 'json', False))
         if not getattr(args, "json", False):
             begin_think('思考中')
         turn = None
@@ -1200,7 +1371,7 @@ def chat(args: argparse.Namespace) -> int:
                     print(json.dumps({'ok': False, 'error': '无法在本机保存会话。'}, ensure_ascii=False))
                 return 1
         try:
-            reply = agent.answer(args.message)
+            reply = agent.answer(message)
         except Exception:
             reply = 'Agent 请求失败；请检查服务配置或网络后重试。'
             agent.last_ok = False
@@ -1209,6 +1380,7 @@ def chat(args: argparse.Namespace) -> int:
             if not getattr(args, "json", False):
                 end_think('回答就绪')
         reply = redact_secrets(reply, agent)
+        _USAGE.record(message, reply)
         if turn is not None:
             turn['updated_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
             if agent.last_ok:
@@ -1265,6 +1437,8 @@ def chat(args: argparse.Namespace) -> int:
             return 0
         if action == 'handled':
             continue
+        # @文件引用：把仓库里的文件内容附到消息后面（只读，不允许越出仓库）
+        text = _prepare_message(text, _agent_repo_root(agent))
         begin_think('思考中')
         interrupted = False
         reply = ''
@@ -1277,6 +1451,7 @@ def chat(args: argparse.Namespace) -> int:
             print('\n' + ok('已退出对话。'))
             _autosave_session(agent)
             return 0
+        _USAGE.record(text, reply)
         _print_agent_reply(reply)
 
 
@@ -1447,6 +1622,8 @@ def main() -> int:
     review_parser.add_argument("--config", default=None, help="AI 配置文件（默认 ~/.reviewagent/ai_config.json）")
     review_parser.add_argument("--offline", action="store_true", help="使用本地规则和案例检索，不调用 AI")
     review_parser.add_argument("--output", "-o")
+    review_parser.add_argument("--report", metavar="PATH",
+                               help="额外生成 Markdown 报告（可与 --output 同时使用）")
     review_parser.add_argument("--json", action="store_true", help="输出 JSON")
     review_parser.add_argument("--max-diff", type=int, default=12000)
     review_parser.add_argument("--require-full", action="store_true",
@@ -1455,7 +1632,26 @@ def main() -> int:
                                help="加载专业 Agent：operator=算子，inference=推理，opengauss=openGauss 社区；省略则自动判定")
     review_parser.add_argument("--require-scenario", action="store_true",
                                help="自动判定含糊时返回 needs_context（退出码 2），不进行通用审查")
+    review_parser.add_argument("--fail-on", choices=["none", "low", "medium", "high", "critical"],
+                               default="none",
+                               help="有达到该严重级别的问题时退出码为 1（CI / pre-commit 门禁）")
     review_parser.set_defaults(func=review)
+
+    hook_parser = subparsers.add_parser(
+        'install-hook', help='安装/卸载 git pre-commit 钩子（提交前自动离线审查）')
+    hook_parser.add_argument('--repo', default='.', help='仓库路径（默认当前目录）')
+    hook_parser.add_argument('--severity', choices=list(SEVERITIES), default='high',
+                             help='达到该级别就阻止提交（默认 high）')
+    hook_parser.add_argument('--force', action='store_true',
+                             help='覆盖已有的第三方 pre-commit（会先备份）')
+    hook_parser.add_argument('--remove', action='store_true', help='卸载本工具生成的钩子')
+    hook_parser.set_defaults(func=install_hook_cmd)
+
+    open_parser = subparsers.add_parser(
+        'open', help='用系统默认程序打开配置/备份/会话目录')
+    open_parser.add_argument('target', nargs='?', default='config',
+                             help='config|home|sessions|backups|repo，或任意路径（默认 config）')
+    open_parser.set_defaults(func=open_cmd)
 
     test_parser = subparsers.add_parser("test", help="运行项目测试")
     test_parser.add_argument("--path", default=".")
@@ -1514,13 +1710,21 @@ def main() -> int:
     config_parser.add_argument('--wizard', action='store_true', help='交互式填写 provider / model / api_key')
     config_parser.add_argument('--show', action='store_true', help='显示当前配置（隐藏密钥）')
     config_parser.add_argument('--set', nargs='+', metavar='KEY=VALUE', help='写入配置项，如 provider=openai')
+    config_parser.add_argument('--backup', action='store_true', help='备份当前配置')
+    config_parser.add_argument('--backups', action='store_true', help='列出已有备份')
+    config_parser.add_argument('--restore', nargs='?', const='latest', default=None,
+                               help='恢复备份：默认最近一份，也可写名字片段')
     config_parser.set_defaults(func=config_cmd)
 
     doctor_parser = subparsers.add_parser('doctor', help='检查 Python/配置/模型环境')
     doctor_parser.add_argument('--config', default=None)
     doctor_parser.set_defaults(func=doctor)
 
-    model_parser = subparsers.add_parser('model', help='查看或切换 provider/model（可与 cc-switch 配合）')
+    model_parser = subparsers.add_parser('model', help='查看/列出/切换 provider/model（可与 cc-switch 配合）')
+    model_parser.add_argument('--list', action='store_true',
+                              help='列出 CATALOG 里的厂商与模型（只读，可配 --json 供程序解析）')
+    model_parser.add_argument('--json', action='store_true',
+                              help='配合 --list，输出纯 JSON（不含提示文字与颜色）')
     model_parser.add_argument('--provider', choices=['openai', 'deepseek', 'claude', 'glm'])
     model_parser.add_argument('--name', help='模型名，如 deepseek-chat / gpt-4o')
     model_parser.add_argument('--base-url', help='OpenAI 兼容网关 base_url')

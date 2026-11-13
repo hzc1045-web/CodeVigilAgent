@@ -23,6 +23,8 @@ class DesktopPackagingTests(unittest.TestCase):
         files = {
             'ascend_cli.py': '# fixture CLI\n',
             'scripts/ai_adapter.py': '# fixture adapter\n',
+            'scripts/cli_commands/__init__.py': '# fixture command registry\n',
+            'scripts/cli_commands/convenience.py': '# fixture command\n',
             'config/ai_config.json.template': '{"api_key":"YOUR_API_KEY_HERE"}',
             'package.json': '{"version":"1.8.0"}',
             'desktop-app/CodeVigilAgentApp.swift': '// fixture Swift\n',
@@ -77,6 +79,8 @@ class DesktopPackagingTests(unittest.TestCase):
         backend = app / 'Contents/Resources/backend'
         actual = {p.relative_to(backend).as_posix() for p in backend.rglob('*') if p.is_file()}
         self.assertEqual(actual, {'ascend_cli.py', 'scripts/ai_adapter.py',
+                                 'scripts/cli_commands/__init__.py',
+                                 'scripts/cli_commands/convenience.py',
                                  'config/ai_config.json.template', 'data/raw/public.json',
                                  '.cursor/agents/advisor.md'})
         manifest = json.loads((app / 'Contents/Resources/build-manifest.json').read_text())

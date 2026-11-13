@@ -31,6 +31,26 @@ GitCode 在线上下文、技能安装和社区采集只读取 `GITCODE_TOKEN`�
 
 ---
 
+## 🗂 项目地图
+
+根目录只保留「入口 + 核心目录」，其余按用途归档（详细分层见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)）：
+
+| 路径 | 放什么 |
+|------|--------|
+| `ascend_cli.py` | 主入口：`review` / `chat` / `doctor` / `config` / `sessions` / `model` |
+| `chat_v2.py` `review.py` | 终端对话界面 / npm 包兼容入口 |
+| `review_cli.py` | 旧版 CLI，文档仍在引用，保留兼容 |
+| `bin/` `scripts/` | Node CLI 层 / Python 业务层（审查、知识库、MCP、终端渲染） |
+| `desktop-app/win/` | Windows 桌面版：`app.py` 入口 + `cvapp/` 分层实现（功能注册表） |
+| `tests/` | Python 离线回归与 Node 配置向导测试（`npm test` 统一执行） |
+| `docs/` | 设计、使用与架构文档 |
+| `launchers/` | 次要启动脚本（兼容模式 / 边框体检 / 新用户模式） |
+| `legacy/` | 已退役入口，仅留档，日常不用 |
+| `启动桌面版.bat` | 双击打开 Windows 桌面版 |
+| `start-reviewagent.bat` | 双击打开终端版 |
+
+---
+
 ## 🚀 30 秒快速开始（Hermes 风格）
 
 ```bash
@@ -64,7 +84,93 @@ python ascend_cli.py review --json --output report.json
 Windows 下也可以直接运行：
 
 ```bat
-ascend.bat review
+launchers\ascend.bat review
+```
+
+### 四个效率能力（2026-11-12 新增）
+
+**1. 自定义斜杠命令** —— 把常用提问存成 Markdown，随仓库共享（参考 Claude Code 的 `.claude/commands`）：
+
+```text
+.reviewagent/commands/并发.md     →  /并发 <文件>
+.reviewagent/commands/db/slow.md  →  /db:slow    （子目录=命名空间）
+```
+
+```text
+/commands            # 列出所有命令（项目级 + 用户级 ~/.reviewagent/commands）
+/并发 src/server.py   # 正文里的 $ARGUMENTS 会替换成参数
+```
+
+**2. `@文件` 引用** —— 直接把仓库文件内容带进对话（参考 Cursor / aider `/read`）：
+
+```text
+这个函数为什么会泄漏？@src/server.py
+对比一下 @src/old.py 和 @src/new.py
+@scripts/            # 目录会列成清单
+```
+
+只允许仓库内路径，单文件上限 64 KB，一次最多 8 个，二进制自动跳过。
+相对路径按**当前选中的仓库**解析（桌面版选哪个仓库就在哪个仓库里找）。
+
+**3. 提交前门禁** —— 装一个钩子，`git commit` 前自动跑离线审查（不需要 API Key）：
+
+```bash
+python ascend_cli.py install-hook --severity high   # 安装
+python ascend_cli.py install-hook --remove          # 卸载
+python ascend_cli.py review --staged --offline --fail-on high   # 手动跑
+```
+
+有 `high` 及以上问题时退出码为 1，提交被阻止；阈值可选 `low/medium/high/critical`。
+钩子要求完整范围：diff被截断或包含未提供内容的二进制文件时也会阻止提交，需拆分变更或另外验证。
+已安装旧版钩子的仓库需重新运行 `install-hook` 更新；离线规则不能替代项目测试与人工审查。
+
+**4. 用量估算** —— 会话内 `/cost` 查看本轮调用量（参考 Claude Code `/cost`）：
+
+```text
+/cost     # 调用次数 / 输入输出 token 估算
+```
+
+按中英文分别估算，不报金额（各网关单价差异太大）。
+
+### 顺手的小功能（与审查逻辑无关）
+
+**打开常用目录**（省得自己找 `~/.reviewagent` 在哪）：
+
+```bash
+ascend_cli.py open config      # 配置目录
+ascend_cli.py open sessions    # 会话记录
+ascend_cli.py open backups     # 配置备份
+ascend_cli.py open repo        # 当前目录
+ascend_cli.py open "D:/任意/路径"
+```
+
+Windows 交给默认程序，macOS 用 `open`，Linux 用 `xdg-open`；找不到会明确提示，不静默失败。
+对话里等价命令：`/dir repo|config|sessions|backups`（`/open` 是内置的「打开历史会话」，两者不冲突）。
+
+**配置备份 / 回滚**（改错 key 也能退回去）：
+
+```bash
+ascend_cli.py config --backup        # 手动备份一份
+ascend_cli.py config --backups       # 看看有哪些
+ascend_cli.py config --restore       # 恢复最近一份
+ascend_cli.py config --restore 1901  # 按名字片段恢复
+```
+
+`config --set` 在写入前会**自动备份**，默认保留最近 20 份，恢复前还会再存一份“恢复前状态”。
+
+**复制上一条回答**：
+
+```text
+/copy
+```
+
+Windows 直接调系统剪贴板（ctypes，无第三方库），macOS 用 `pbcopy`，
+Linux 依次尝试 `wl-copy` / `xclip` / `xsel`；都没有时提示手动复制。
+
+**命令拼错会猜你想输什么**：
+
+```text
+/revew  →  你是不是想输入 /review ？
 ```
 
 ### 本地昇腾案例检索
@@ -316,9 +422,11 @@ python review_cli.py config --set model=claude-3-opus-20240229
 ## 📚 文档
 
 - [CLI 使用指南](docs/CLI_GUIDE.md) - 命令行详细教程
+- [架构说明](docs/ARCHITECTURE.md) - 分层、依赖方向、扩展点
+- [新增功能指南](docs/ADDING-FEATURES.md) - 三步加一个功能
 - [AI 架构文档](docs/AI_ARCHITECTURE.md) - 技术架构
-- [完整总结](FINAL_SUMMARY.md) - 项目全貌
-- [手动执行指南](MANUAL_EXECUTION_GUIDE.md) - 故障排除
+- [完整总结](docs/FINAL_SUMMARY.md) - 项目全貌
+- [手动执行指南](docs/MANUAL_EXECUTION_GUIDE.md) - 故障排除
 
 ---
 

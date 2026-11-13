@@ -79,7 +79,8 @@ for name in sorted(set(paths) - excluded - {''}):
     source = root / name
     parts = Path(name).parts
     allowed = (name in ('ascend_cli.py', 'config/ai_config.json.template', 'LICENSE')
-               or (parts[0] == 'scripts' and len(parts) == 2 and source.suffix == '.py')
+               or (parts[0] == 'scripts' and source.suffix == '.py'
+                   and '__pycache__' not in parts)
                or (parts[:2] in (('data', 'raw'), ('data', 'training'), ('data', 'communities'))
                    and source.suffix == '.json')
                or (parts[0] in ('.cursor', '.agents') and len(parts) > 2
