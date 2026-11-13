@@ -57,7 +57,7 @@ def build_hook(python: str, cli: str, severity: str = 'high') -> str:
 # so the commit is blocked. Remove with: install-hook --remove
 ROOT="$(git rev-parse --show-toplevel)" || exit 1
 cd "$ROOT" || exit 1
-"{python}" "{cli}" review --staged --offline --fail-on {severity}
+"{python}" "{cli}" review --staged --offline --require-full --fail-on {severity}
 {MARKER_END}
 '''
 

@@ -4,6 +4,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -87,7 +90,7 @@ def _safe_relpath(path: str) -> Optional[Path]:
     if re.match(r'^[A-Za-z]:', cleaned):
         return None
     parts = Path(cleaned).parts
-    if any(p == '..' for p in parts):
+    if any(p == '..' or p.casefold() == '.git' for p in parts):
         return None
     return Path(*parts)
 
@@ -144,10 +147,10 @@ def parse_fix_json(raw: str) -> ProposedFix:
             raise ValueError('每个文件的 path/action/search/replace 必须是字符串')
         action = item.get('action', 'replace').strip().lower()
         if action not in ('replace', 'create'):
-            continue
+            raise ValueError('补丁 action 仅允许 replace 或 create')
         path = item['path'].strip()
         if not _safe_relpath(path):
-            continue
+            raise ValueError(f'补丁包含非法或 Git 元数据路径: {path}')
         files.append(FileEdit(
             path=path,
             action=action,
@@ -179,78 +182,178 @@ def preview_fix(fix: ProposedFix, root: Optional[Path] = None) -> str:
         exists = target.is_file()
         lines.append(f'--- [{i}] {edit.action}  {edit.path}  ({"存在" if exists else "不存在"})')
         if edit.action == 'create':
-            snippet = edit.replace[:400]
             lines.append('新建内容预览:')
-            lines.append(snippet + ('…' if len(edit.replace) > 400 else ''))
+            lines.append(edit.replace)
         else:
             lines.append('<<< search')
-            lines.append((edit.search or '')[:400] + ('…' if len(edit.search or '') > 400 else ''))
+            lines.append(edit.search or '')
             lines.append('=== replace')
-            lines.append((edit.replace or '')[:400] + ('…' if len(edit.replace or '') > 400 else ''))
+            lines.append(edit.replace or '')
             lines.append('>>>')
         lines.append('')
     lines.append('确认写入请输入 /apply ；放弃请输入 /discard')
     return '\n'.join(lines)
 
 
-def apply_fix(fix: ProposedFix, root: Optional[Path] = None, dry_run: bool = False) -> Dict:
-    """Apply proposed edits under root. Never writes outside root."""
-    root = (root or work_root()).resolve()
-    results = []
-    ok = 0
-    for edit in fix.files:
-        rel = _safe_relpath(edit.path)
-        if not rel:
-            results.append({'path': edit.path, 'status': 'rejected', 'error': '非法路径'})
-            continue
-        target = (root / rel).resolve()
+def _git_metadata_paths(directory: Path) -> List[Path]:
+    """Ask Git so separate git-dir and worktree common-dir are protected too."""
+    while not directory.is_dir():
+        directory = directory.parent
+    proc = subprocess.run(
+        ['git', '-C', str(directory), 'rev-parse', '--absolute-git-dir', '--git-common-dir'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+        encoding='utf-8', check=False,
+    )
+    if proc.returncode:
+        markers = [directory, *directory.parents]
+        if (proc.returncode != 128 or os.environ.get('GIT_DIR') or any(
+                (p / '.git').exists() or (p / '.git').is_symlink() or
+                ((p / 'HEAD').exists() and ((p / 'objects').exists() or (p / 'commondir').exists()))
+                for p in markers)):
+            raise ValueError('无法确认 Git 元数据边界，拒绝写入')
+        return []
+    paths = proc.stdout.splitlines()
+    if len(paths) != 2 or not all(paths):
+        raise ValueError('Git 元数据路径无效，拒绝写入')
+    return [(directory / path).resolve() for path in paths]
+
+
+def _stage_bytes(target: Path, data: bytes, mode: Optional[int]) -> Path:
+    fd, name = tempfile.mkstemp(prefix='.reviewagent-', dir=str(target.parent))
+    staged = Path(name)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+        if mode is not None:
+            staged.chmod(mode)
+        return staged
+    except BaseException:
         try:
-            target.relative_to(root)
-        except ValueError:
-            results.append({'path': edit.path, 'status': 'rejected', 'error': '路径越界'})
-            continue
+            staged.unlink()
+        except OSError:
+            pass
+        raise
 
-        if edit.action == 'create':
-            if target.exists():
-                results.append({'path': edit.path, 'status': 'skipped', 'error': '文件已存在，拒绝覆盖 create'})
+
+def apply_fix(fix: ProposedFix, root: Optional[Path] = None, dry_run: bool = False) -> Dict:
+    """Validate the whole patch, then replace files with recoverable originals."""
+    root = root or work_root()
+    result = {'root': str(root), 'ok': False, 'applied': 0, 'total': len(fix.files),
+              'dry_run': dry_run, 'results': []}
+    plans, seen, metadata = [], set(), {}
+    try:
+        root = root.resolve(strict=True)
+        result['root'] = str(root)
+        metadata[root] = _git_metadata_paths(root)
+        for edit in fix.files:
+            row = {'path': edit.path, 'status': 'not_applied'}
+            result['results'].append(row)
+            try:
+                rel = _safe_relpath(edit.path)
+                if not rel or edit.action not in ('create', 'replace'):
+                    raise ValueError('非法路径或操作（禁止 Git 元数据）')
+                target = (root / rel).resolve()
+                relative = target.relative_to(root)
+                if any(part.casefold() == '.git' for part in relative.parts):
+                    raise ValueError('禁止修改 Git 元数据')
+                if target in seen:
+                    raise ValueError('同一文件不能包含多条补丁')
+                seen.add(target)
+                if target.parent not in metadata:
+                    metadata[target.parent] = _git_metadata_paths(target.parent)
+                if any(target == path or path in target.parents
+                       for paths in metadata.values() for path in paths):
+                    raise ValueError('禁止修改 Git 元数据')
+                before, mode = None, None
+                if edit.action == 'create':
+                    if target.exists() or target.is_symlink():
+                        raise ValueError('文件已存在，拒绝覆盖 create')
+                    after = edit.replace.encode('utf-8')
+                else:
+                    if not target.is_file():
+                        raise ValueError('本地无此文件（请先 clone/checkout PR 分支）')
+                    before = target.read_bytes()
+                    mode = stat.S_IMODE(target.stat().st_mode)
+                    text = before.decode('utf-8')
+                    newline = '\r\n' if '\r\n' in text else ('\r' if '\r' in text else '\n')
+                    search = edit.search.replace('\r\n', '\n').replace('\r', '\n').replace('\n', newline)
+                    replacement = edit.replace.replace('\r\n', '\n').replace('\r', '\n').replace('\n', newline)
+                    if not search or text.count(search) != 1:
+                        raise ValueError('search 必须非空且唯一匹配')
+                    after = text.replace(search, replacement, 1).encode('utf-8')
+                plans.append({'target': target, 'before': before, 'after': after,
+                              'mode': mode, 'row': row, 'action': edit.action})
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                row.update(status='rejected', error=str(exc))
+        if any(row['status'] == 'rejected' for row in result['results']):
+            result['error'] = '补丁验证失败，未写入任何文件'
+            return result
+        if dry_run:
+            for plan in plans:
+                plan['row']['status'] = 'would_' + plan['action']
+            result.update(ok=True, applied=len(plans))
+            return result
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        result['error'] = f'补丁验证失败，未写入任何文件: {exc}'
+        return result
+
+    staged, written, created_dirs, recovery = [], [], [], set()
+    try:
+        for plan in plans:
+            target = plan['target']
+            missing = []
+            parent = target.parent
+            while not parent.exists():
+                missing.append(parent)
+                parent = parent.parent
+            for directory in reversed(missing):
+                directory.mkdir()
+                created_dirs.append(directory)
+            plan['new'] = _stage_bytes(target, plan['after'], plan['mode'])
+            staged.append(plan['new'])
+            if plan['before'] is not None:
+                plan['backup'] = _stage_bytes(target, plan['before'], plan['mode'])
+                staged.append(plan['backup'])
+        for plan in plans:
+            target = plan['target']
+            if ((plan['before'] is None and (target.exists() or target.is_symlink())) or
+                    (plan['before'] is not None and target.read_bytes() != plan['before'])):
+                raise ValueError(f'验证后文件已变化，拒绝覆盖: {plan["row"]["path"]}')
+            os.replace(plan['new'], target)
+            written.append(plan)
+            plan['row']['status'] = 'created' if plan['action'] == 'create' else 'replaced'
+        result.update(ok=True, applied=len(written))
+    except (OSError, ValueError, KeyboardInterrupt) as exc:
+        result['error'] = f'写入失败或已中断，已尝试恢复原文件: {exc}'
+        for plan in reversed(written):
+            try:
+                if plan['before'] is None:
+                    plan['target'].unlink()
+                else:
+                    os.replace(plan['backup'], plan['target'])
+                plan['row']['status'] = 'rolled_back'
+            except OSError as rollback_exc:
+                plan['row'].update(status='rollback_failed', error=str(rollback_exc))
+                result.setdefault('rollback_errors', []).append(plan['row']['path'])
+                if plan.get('backup'):
+                    recovery.add(plan['backup'])
+                    plan['row']['recovery_file'] = str(plan['backup'])
+        result['applied'] = sum(p['row']['status'] == 'rollback_failed' for p in written)
+    finally:
+        for path in staged:
+            if path in recovery:
                 continue
-            if not dry_run:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(edit.replace.encode('utf-8'))
-            results.append({'path': edit.path, 'status': 'created' if not dry_run else 'would_create'})
-            ok += 1
-            continue
-
-        # replace
-        if not target.is_file():
-            results.append({'path': edit.path, 'status': 'skipped', 'error': '本地无此文件（请先 clone/checkout PR 分支）'})
-            continue
-        text = target.read_bytes().decode('utf-8')
-        newline = '\r\n' if '\r\n' in text else ('\r' if '\r' in text else '\n')
-        search = edit.search.replace('\r\n', '\n').replace('\r', '\n').replace('\n', newline)
-        replacement = edit.replace.replace('\r\n', '\n').replace('\r', '\n').replace('\n', newline)
-        if not search:
-            results.append({'path': edit.path, 'status': 'skipped', 'error': 'search 为空'})
-            continue
-        count = text.count(search)
-        if count == 0:
-            results.append({'path': edit.path, 'status': 'skipped', 'error': '未找到 search 片段'})
-            continue
-        if count > 1:
-            results.append({'path': edit.path, 'status': 'skipped', 'error': f'search 匹配 {count} 处，拒绝歧义写入'})
-            continue
-        if not dry_run:
-            target.write_bytes(text.replace(search, replacement, 1).encode('utf-8'))
-        results.append({'path': edit.path, 'status': 'replaced' if not dry_run else 'would_replace'})
-        ok += 1
-
-    return {
-        'root': str(root),
-        'applied': ok,
-        'total': len(fix.files),
-        'dry_run': dry_run,
-        'results': results,
-    }
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        if not result['ok']:
+            for directory in reversed(created_dirs):
+                try:
+                    directory.rmdir()
+                except OSError:
+                    pass
+    return result
 
 
 def format_apply_result(result: Dict) -> str:
@@ -260,7 +363,11 @@ def format_apply_result(result: Dict) -> str:
         + ('（dry-run）' if result.get('dry_run') else ''),
         '',
     ]
+    if result.get('error'):
+        lines.extend([result['error'], ''])
     for row in result.get('results') or []:
         err = f" — {row['error']}" if row.get('error') else ''
         lines.append(f"  [{row.get('status')}] {row.get('path')}{err}")
+        if row.get('recovery_file'):
+            lines.append(f"    原文件备份: {row['recovery_file']}")
     return '\n'.join(lines)

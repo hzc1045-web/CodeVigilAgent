@@ -85,9 +85,10 @@ class SpecialistOpenGaussTests(unittest.TestCase):
 class McpClientTests(unittest.TestCase):
     def test_builtin_ascend_doc(self):
         self.assertIn('ascend-doc', BUILTIN_SERVERS)
-        cfg = load_mcp_config()
+        with patch('scripts.mcp_client.config_paths', return_value=[]):
+            cfg = load_mcp_config()
         self.assertIn('ascend-doc', cfg)
-        self.assertEqual(cfg['ascend-doc'].args[-1], 'ascend-doc-mcp@latest')
+        self.assertEqual(cfg['ascend-doc'].args[-1], 'ascend-doc-mcp@1.0.1')
 
     def test_fake_stdio_session(self):
         # MCP stdio uses newline-delimited JSON-RPC.

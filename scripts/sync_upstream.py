@@ -34,7 +34,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import ntpath
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -124,7 +126,8 @@ def diff_files(base: str, head: str) -> tuple[list[dict], list[dict]]:
                 "date": c["commit"]["author"]["date"],
                 "author": c["commit"]["author"]["name"]}
                for c in data.get("commits", [])]
-    files = [{"path": f["filename"], "status": f["status"]} for f in data.get("files", [])]
+    files = [{"path": f["filename"], "status": f["status"],
+              "previous_path": f.get("previous_filename")} for f in data.get("files", [])]
     return commits, files
 
 
@@ -139,51 +142,110 @@ def fetch_file(sha: str, path: str) -> bytes | None:
         raise
 
 
+def _git_dirs(directory: Path | None = None) -> list[Path]:
+    directory = directory or Path(REPO_DIR)
+    while not directory.is_dir():
+        directory = directory.parent
+    code, output = git('-C', str(directory), 'rev-parse', '--absolute-git-dir', '--git-common-dir')
+    if code:
+        if any((parent / '.git').exists() for parent in (directory, *directory.parents)):
+            raise ValueError('无法确认 Git 元数据边界，拒绝同步')
+        return []
+    paths = output.splitlines()
+    if len(paths) != 2:
+        raise ValueError('Git 元数据路径无效，拒绝同步')
+    return [(directory / path).resolve() for path in paths]
+
+
+def _destination(path: str, git_dirs: list[Path]) -> Path:
+    root = Path(REPO_DIR).resolve()
+    parts = path.replace('\\', '/').split('/')
+    if (not path or ntpath.isabs(path) or ntpath.splitdrive(path)[0] or '..' in parts or
+            any(part.casefold() == '.git' for part in parts)):
+        raise ValueError(f'拒绝不安全的同步路径：{path}')
+    target = root / path
+    resolved = target.resolve()
+    if resolved == root or root not in resolved.parents:
+        raise ValueError(f'同步路径超出仓库：{path}')
+    if any(resolved == metadata or metadata in resolved.parents
+           for metadata in git_dirs + _git_dirs(target.parent)):
+        raise ValueError(f'拒绝修改 Git 元数据：{path}')
+    # 同步器只处理普通文件，不能把链接当普通文件覆盖或跟进链接目录。
+    if any(part.is_symlink() for part in (target, *target.parents) if part != root):
+        raise ValueError(f'拒绝通过符号链接同步：{path}')
+    return target
+
+
 def plan(files: list[dict], base: str, head: str) -> dict:
     """三方比对，产出 安全写入 / 已同步 / 冲突 三组。"""
     safe: list[dict] = []          # {"path", "data"(None=删除), "kind"}
     skipped: list[str] = []
     conflicted: list[str] = []
+    conflict_changes: list[dict] = []
+    git_dirs = _git_dirs()
+    changed_paths = {f['path'] for f in files}
     for f in files:
-        path = f["path"]
-        if any(path.startswith(p) for p in SKIP_PREFIX) or path.endswith(SKIP_SUFFIX):
+        changes = [f]
+        if f['status'] == 'renamed':
+            previous = f.get('previous_path')
+            if not previous:
+                raise ValueError(f'重命名缺少原路径：{f["path"]}')
+            _destination(previous, git_dirs)
+            if previous not in changed_paths:
+                changes.append({'path': previous, 'status': 'removed'})
+        for change in changes:
+            _destination(change['path'], git_dirs)
+        if any(any(change['path'].startswith(p) for p in SKIP_PREFIX) or
+               change['path'].endswith(SKIP_SUFFIX) for change in changes):
             continue
-        new = None if f["status"] == "removed" else fetch_file(head, path)
-        old = fetch_file(base, path)
-        dst = os.path.join(REPO_DIR, path)
-        local = None
-        if os.path.exists(dst):
-            with open(dst, "rb") as fh:
-                local = fh.read()
 
-        if local is not None and new is not None and local == new:
-            skipped.append(path)
-        elif local == old:                      # 本地没动过（含新增/删除的对称情形）
-            kind = "del" if new is None else ("add" if local is None else "mod")
-            safe.append({"path": path, "data": new, "kind": kind})
-        elif local is None and f["status"] == "added":
-            safe.append({"path": path, "data": new, "kind": "add"})
+        pending, unchanged, conflicts, updates = [], [], [], []
+        for change in changes:
+            path = change['path']
+            new = None if change['status'] == 'removed' else fetch_file(head, path)
+            if new is None and change['status'] != 'removed':
+                raise FileNotFoundError(f'上游新版本缺少文件：{path}')
+            old = fetch_file(base, path)
+            dst = _destination(path, git_dirs)
+            local = dst.read_bytes() if dst.exists() else None
+            kind = 'del' if new is None else ('add' if local is None else 'mod')
+            update = {'path': path, 'data': new, 'kind': kind}
+            updates.append(update)
+            if local == new:
+                unchanged.append(path)
+            elif local == old or (local is None and change['status'] == 'added'):
+                pending.append(update)
+            else:
+                conflicts.append(path)
+        if conflicts:
+            # 重命名任一端有本地改动，就保留两端交给用户合并。
+            conflicted.extend(change['path'] for change in changes)
+            conflict_changes.extend(updates)
         else:
-            conflicted.append(path)
-    return {"safe": safe, "skipped": skipped, "conflicted": conflicted}
+            safe.extend(pending)
+            skipped.extend(unchanged)
+    return {"safe": safe, "skipped": skipped, "conflicted": conflicted,
+            "conflict_changes": conflict_changes}
 
 
 def apply_plan(p: dict, force: bool, base: str, head: str) -> list[str]:
     written: list[str] = []
     todo = list(p["safe"])
     if force:
-        for path in p["conflicted"]:
-            todo.append({"path": path, "data": fetch_file(head, path), "kind": "mod"})
+        todo.extend(p['conflict_changes'])
+    git_dirs = _git_dirs()
+    for item in todo:
+        _destination(item['path'], git_dirs)
     for item in todo:
         path, data = item["path"], item["data"]
-        dst = os.path.join(REPO_DIR, path)
+        dst = _destination(path, git_dirs)
         if data is None:
             if os.path.exists(dst):
                 os.remove(dst)
                 written.append(f"- {path}")
             continue
         os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-        with open(dst, "wb") as fh:
+        with open(_destination(path, git_dirs), "wb") as fh:
             fh.write(data)
         written.append(f"{item['kind']} {path}")
     return written
@@ -258,12 +320,16 @@ def main() -> int:
     try:
         commits, files = diff_files(base, head["sha"])
         p = plan(files, base, head["sha"])
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as exc:
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError) as exc:
         out(f"[错误] 计算增量失败：{exc}")
         return 2
 
-    written = apply_plan(p, args.force, base, head["sha"]) if args.apply else []
-    report = write_report(head, commits, p, written, local_sha)
+    try:
+        written = apply_plan(p, args.force, base, head["sha"]) if args.apply else []
+        report = write_report(head, commits, p, written, local_sha)
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        out(f'[错误] 同步失败：{exc}')
+        return 2
     safe_paths = [i["path"] for i in p["safe"]]
 
     if args.json:

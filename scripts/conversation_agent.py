@@ -649,8 +649,9 @@ class ConversationAgent:
             return '补丁为空，未写入任何文件。'
         self.progress('写入本地改动…' if not dry_run else 'dry-run 检查…')
         result = apply_fix(self.pending_fix, root=self.work_root, dry_run=dry_run)
+        self.last_ok = bool(result.get('ok'))
         text = format_apply_result(result)
-        if not dry_run:
+        if not dry_run and self.last_ok:
             self.pending_fix = None
             text += '\n\n待确认补丁已清除。可用 git diff 检查改动。'
         return text
@@ -718,6 +719,10 @@ class ConversationAgent:
                 self.progress(f'调查 {step + 1}/3 · mcp:{server}/{name}')
                 try:
                     registry = self.mcp_registry()
+                    if not registry.is_trusted(server):
+                        results.append({'tool': tool, 'argument': f'{server}/{name}',
+                                        'error': 'MCP 进程尚未获信任；请先 /mcp tools 确认程序执行权限'})
+                        continue
                     session = registry.get_session(server)
                     descriptor = next((t for t in session.tools
                                        if isinstance(t, dict) and t.get('name') == name), {}) if session else {}

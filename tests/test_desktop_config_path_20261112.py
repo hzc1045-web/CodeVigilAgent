@@ -5,6 +5,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -31,13 +32,17 @@ class DesktopConfigPathTests(unittest.TestCase):
         self.assertEqual(path.parent.parent, Path.home())
 
     def test_reviewagent_home_is_honoured(self):
-        path = Path(self.config_path(REVIEWAGENT_HOME=r'D:\tmp\ra_test_home'))
-        self.assertEqual(path, Path(r'D:\tmp\ra_test_home\ai_config.json'))
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / 'ra_test_home'
+            path = Path(self.config_path(REVIEWAGENT_HOME=str(home)))
+            self.assertEqual(path, home / 'ai_config.json')
 
     def test_reviewagent_config_wins(self):
-        path = Path(self.config_path(REVIEWAGENT_CONFIG=r'D:\tmp\custom.json',
-                                     REVIEWAGENT_HOME=r'D:\tmp\ignored'))
-        self.assertEqual(path, Path(r'D:\tmp\custom.json'))
+        with tempfile.TemporaryDirectory() as tmp:
+            custom = Path(tmp) / 'custom.json'
+            path = Path(self.config_path(REVIEWAGENT_CONFIG=str(custom),
+                                         REVIEWAGENT_HOME=str(Path(tmp) / 'ignored')))
+            self.assertEqual(path, custom)
 
 
 if __name__ == '__main__':

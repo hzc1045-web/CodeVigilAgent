@@ -20,6 +20,29 @@ from .base import Feature
 CUSTOM_FALLBACK_TITLE = '自定义模型…'
 
 
+class GatewayKey:
+    """A key stays with the provider and endpoint it was entered for."""
+    def __init__(self, provider: str, base_url: str, key: str):
+        self.original = self.identity(provider, base_url)
+        self.current = self.original
+        self.saved_key = key
+
+    @staticmethod
+    def identity(provider: str, base_url: str) -> tuple[str, str]:
+        return provider.strip().lower(), base_url.strip().rstrip('/')
+
+    def update(self, provider: str, base_url: str, key: str) -> str:
+        target = self.identity(provider, base_url)
+        if target != self.current:
+            self.current = target
+            return self.saved_key if target == self.original else ''
+        return key
+
+    @property
+    def changed(self) -> bool:
+        return self.current != self.original
+
+
 def _load_choices(provider: str, model: str):
     """返回 (choices, 错误信息)。任何异常都不抛给界面。"""
     try:
@@ -65,14 +88,12 @@ def open_settings(app) -> None:
     body.grid_columnconfigure(1, weight=1)
 
     choices, load_error = _load_choices(provider0, model0)
-    # 打开对话框时的 base_url，用来判断用户是否真的换了厂商
-    # （换厂商就必须换密钥：qwen 的 key 拿到 dashscope 上是 401）
-    original_base = str(cfg.get('base_url') or '').strip().rstrip('/')
     state = {
         'choices': choices,
-        'saved_key': str(cfg.get('api_key') or ''),   # 原配置里的密钥，切回原厂商时恢复
-        'key_missing': False,                         # 已换厂商但还没填新密钥
     }
+    key_binding = GatewayKey(provider0 or 'deepseek', str(cfg.get('base_url') or ''),
+                             str(cfg.get('api_key') or ''))
+    base_var = tk.StringVar(value=str(cfg.get('base_url') or ''))
     custom_title = choices.get('custom_title') or CUSTOM_FALLBACK_TITLE
 
     # Windows 默认的 vista 主题会忽略 Combobox 的 fieldbackground/foreground，
@@ -155,6 +176,7 @@ def open_settings(app) -> None:
 
         row_label(3, 'API 地址')
         base_entry = make_entry(3, str(cfg.get('base_url') or ''))
+        base_entry.configure(textvariable=base_var)
 
         syncing = {'on': False}
 
@@ -176,26 +198,11 @@ def open_settings(app) -> None:
 
             state['choices'] = select_provider(state['choices'], provider_cb.current())
             refresh_models()
-            new_base = str(state['choices']['base_url'] or '').strip().rstrip('/')
             # 切厂商自动带出该厂商 base_url，用户之后仍可改
-            base_entry.delete(0, 'end')
-            base_entry.insert(0, state['choices']['base_url'])
-            # 换了厂商 → 旧密钥对新厂商一定无效（各家 key 不通用）。
-            # 不清掉的话，用户会看到一串星号以为已经填好了，保存后必然 401。
-            if new_base != original_base:
-                if key_entry.get().strip():
-                    key_entry.delete(0, 'end')
-                state['key_missing'] = True
-                label = state['choices']['options'][provider_cb.current()]['label'] \
-                    if 0 <= provider_cb.current() < len(state['choices']['options']) else ''
-                hint.configure(
-                    text=f'已切换到 {label}\n旧密钥已清空，请填写 {label} 的 API Key。',
-                    fg=theme.DANGER)
-            else:
-                if not key_entry.get().strip() and state['saved_key']:
-                    key_entry.insert(0, state['saved_key'])
-                state['key_missing'] = False
-                hint.configure(text=list_hint_text, fg=theme.FG_FAINT)
+            option = state['choices']['options'][state['choices']['index']]
+            base_var.set(str(cfg.get('base_url') or '') if option['keep']
+                         else state['choices']['base_url'])
+            sync_key()
 
         def on_model(_event=None) -> None:
             from scripts.model_choices import select_model
@@ -239,6 +246,7 @@ def open_settings(app) -> None:
         provider_cb = model_cb = None
         row_label(1, 'API 地址')
         base_entry = make_entry(1, str(cfg.get('base_url') or ''))
+        base_entry.configure(textvariable=base_var)
         hint.configure(text=f'无法读取模型清单：{load_error}\n已改为手动输入，保存不会改动其它配置。',
                        fg=theme.DANGER)
         degrade = True
@@ -248,7 +256,25 @@ def open_settings(app) -> None:
     key_entry = make_entry(last_row - 1, str(cfg.get('api_key') or ''), show='*')
     hint.grid(row=last_row, column=0, columnspan=2, sticky='ew', pady=(10, 0))
 
+    def sync_key(*_args) -> None:
+        provider = provider0 or 'deepseek'
+        if not degrade:
+            option = state['choices']['options'][state['choices']['index']]
+            provider = option['file_provider'] or provider
+        key = key_binding.update(provider, base_var.get(), key_entry.get())
+        if key != key_entry.get():
+            key_entry.delete(0, 'end')
+            key_entry.insert(0, key)
+        if key_binding.changed:
+            hint.configure(text='服务商或 API 地址已变更\n请填写该地址对应的 API Key。',
+                           fg=theme.DANGER)
+        elif not degrade:
+            hint.configure(text=list_hint_text, fg=theme.FG_FAINT)
+
+    base_var.trace_add('write', sync_key)
+
     def save() -> None:
+        sync_key()
         if degrade:
             model = custom_entry.get().strip()
             picked = (provider0, model) if model else None
@@ -268,11 +294,9 @@ def open_settings(app) -> None:
         key = key_entry.get().strip()
         # 换了厂商却没填新密钥 → 写进去的是别家的 key，调用必然 401。
         # 与其让用户拿到看不懂的报错，不如在这里拦住。
-        if not degrade and state.get('key_missing') and not key:
-            label = state['choices']['options'][state['choices'].get('index', 0)]['label'] \
-                if state['choices'].get('options') else '该厂商'
-            hint.configure(text=f'还没填 {label} 的 API Key\n'
-                                f'留空保存会沿用旧厂商的密钥，调用一定失败。',
+        if key_binding.changed and not key:
+            hint.configure(text='还没填新服务商或地址的 API Key\n'
+                                '请填写后再保存。',
                            fg=theme.DANGER)
             key_entry.focus_set()
             return

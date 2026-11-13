@@ -24,9 +24,8 @@ class PatchFixUnitTests(unittest.TestCase):
                 {'path': '../evil', 'action': 'replace', 'search': 'a', 'replace': 'b'},
             ],
         })
-        fix = parse_fix_json(raw)
-        self.assertEqual(len(fix.files), 1)
-        self.assertEqual(fix.files[0].path, 'ops/a.cpp')
+        with self.assertRaises(ValueError):
+            parse_fix_json(raw)
 
     def test_apply_replace_unique_only(self):
         with tempfile.TemporaryDirectory() as tmp:

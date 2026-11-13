@@ -74,7 +74,24 @@ function homeDir() {
 }
 
 function configPath() {
-  return path.join(homeDir(), 'ai_config.json');
+  return process.env.REVIEWAGENT_CONFIG || path.join(homeDir(), 'ai_config.json');
+}
+
+function ensureHome() {
+  const home = homeDir();
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  fs.chmodSync(home, 0o700);
+  const target = configPath();
+  if (fs.existsSync(target)) fs.chmodSync(target, 0o600);
+  return home;
+}
+
+function writeConfig(data) {
+  ensureHome();
+  const target = configPath();
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(target, `${JSON.stringify(data, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  return target;
 }
 
 function readConfig() {
@@ -215,6 +232,8 @@ module.exports = {
   LOGO_ROWS,
   homeDir,
   configPath,
+  ensureHome,
+  writeConfig,
   readConfig,
   hasUsableApiKey,
   splash,

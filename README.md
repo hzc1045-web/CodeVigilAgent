@@ -2,6 +2,8 @@
 
 专为昇腾 NPU / AI Infra 打造的智能体（Hermes 风格 CLI + Cursor Subagent）。
 
+2026-11-11 安全与可靠性修复见 [审计修复记录](docs/AUDIT_FIXES.md)；Mac 包的构建与核验见 [桌面构建说明](docs/DESKTOP_BUILD.md)。
+
 仓库：[`enternalna-Koh/CodeVigilAgent`](https://github.com/enternalna-Koh/CodeVigilAgent)。
 
 [![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
@@ -23,7 +25,7 @@
 
 `/skill load <name>` 只接受完整材料，已加载技能的组合正文上限为 16,000 字符、32 KiB UTF-8；超限会保留原有技能并提示失败。恢复会话时只提示原技能名，需要重新加载。安装器当前仅下载 `SKILL.md` 和小于等于 200 KB 的 Markdown references；遗漏材料会显示为不完整。references 保存在本地，`/skill load` 当前只把 `SKILL.md` 正文加入会话。
 
-`/mcp tools <server>` 启动配置的本地 MCP 进程并读取工具。自动调查只执行服务端声明 `readOnlyHint: true` 且未声明破坏性的工具；该声明由服务端提供，配置自定义服务时仍需确认来源。`/mcp call <server> <tool> {}` 可显式调用其他工具，参数须为 JSON 对象。退出对话、重载或超时会清理连接。内置服务仍需实际安装包及对应 Node 环境，本仓离线回归使用本地假服务端。
+`/mcp tools <server>` 和 `/mcp call <server> <tool> {}` 首次启动进程前，须由用户确认当前命令权限；模型自动调查不能授权未信任进程。命令、参数、显式环境变量或工作目录变化会使信任失效。内置服务固定为 `ascend-doc-mcp@1.0.1`，已有 `@latest` 配置需手动更新。子进程仅继承必要运行环境及服务显式配置的变量，不自动继承模型或平台密钥。自动调查仍只执行服务端声明 `readOnlyHint: true` 且未声明破坏性的工具；这不是文件沙箱，程序仍以当前账户权限运行。退出对话、重载或超时会清理连接。详见 [MCP 进程信任](docs/MCP.md)；本仓离线回归使用本地假服务端。
 
 GitCode 在线上下文、技能安装和社区采集只读取 `GITCODE_TOKEN`，不会借用 `GITHUB_TOKEN`。采集失败会返回非零退出码，保留失败资源的旧数据；成功资源仍可更新。新采集文件名包含社区、owner 和仓库名，原有旧命名文件保留。
 
@@ -40,7 +42,7 @@ GitCode 在线上下文、技能安装和社区采集只读取 `GITCODE_TOKEN`�
 | `review_cli.py` | 旧版 CLI，文档仍在引用，保留兼容 |
 | `bin/` `scripts/` | Node CLI 层 / Python 业务层（审查、知识库、MCP、终端渲染） |
 | `desktop-app/win/` | Windows 桌面版：`app.py` 入口 + `cvapp/` 分层实现（功能注册表） |
-| `tests/` | 回归测试（286 项 Python + 9 项 JS） |
+| `tests/` | Python 离线回归与 Node 配置向导测试（`npm test` 统一执行） |
 | `docs/` | 设计、使用与架构文档 |
 | `launchers/` | 次要启动脚本（兼容模式 / 边框体检 / 新用户模式） |
 | `legacy/` | 已退役入口，仅留档，日常不用 |
@@ -119,6 +121,8 @@ python ascend_cli.py review --staged --offline --fail-on high   # 手动跑
 ```
 
 有 `high` 及以上问题时退出码为 1，提交被阻止；阈值可选 `low/medium/high/critical`。
+钩子要求完整范围：diff被截断或包含未提供内容的二进制文件时也会阻止提交，需拆分变更或另外验证。
+已安装旧版钩子的仓库需重新运行 `install-hook` 更新；离线规则不能替代项目测试与人工审查。
 
 **4. 用量估算** —— 会话内 `/cost` 查看本轮调用量（参考 Claude Code `/cost`）：
 

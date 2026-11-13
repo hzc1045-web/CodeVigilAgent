@@ -15,7 +15,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from scripts.repo_context import RepoContextError, collect_repo_context, format_repo_prompt
+from scripts.repo_context import RepoContextError, collect_repo_context, format_repo_prompt, review_coverage
 from scripts.smart_reviewer import SmartReviewer
 from scripts.agent_tools import find_test_commands, run_command
 from scripts.knowledge_search import KnowledgeSearch, PROJECT_ROOT
@@ -278,12 +278,13 @@ def review(args: argparse.Namespace) -> int:
             if getattr(args, "report", None):
                 print("[INFO] 没有可审查的 diff，未生成 Markdown 报告。")
         return 0
-    if context["diff_truncated"]:
+    coverage = review_coverage(context)
+    if coverage['coverage'] == 'partial':
         if args.require_full:
-            print(f"[ERROR] diff 共 {context['diff_total_chars']} 字符，超出 --max-diff {args.max_diff}，"
-                  "无法完成完整审查；请调大 --max-diff 或分批提交。", file=sys.stderr)
+            print(f"[ERROR] {coverage['coverage_note']}；无法完成完整审查。"
+                  "截断时可调大 --max-diff 或分批提交；二进制内容需另外验证。", file=sys.stderr)
             return 1
-        print("[WARN] diff 超出大小限制，当前结果仅覆盖前半部分（报告中 coverage=partial）。", file=sys.stderr)
+        print(f"[WARN] {coverage['coverage_note']}（coverage=partial）。", file=sys.stderr)
 
     prompt = format_repo_prompt(context)
     paths = context.get("changed_files") or []
@@ -1173,60 +1174,6 @@ def handle_chat_slash(text: str, agent: ConversationAgent, reload_client=None, c
         print(mute('用法: /skill list | /skill load <名> | /skill install torch-npu-pr-review'))
         return 'handled'
 
-    if cmd == '/mcp':
-        from scripts.mcp_client import ensure_default_user_mcp, get_registry
-        ensure_default_user_mcp()
-        reg = agent.mcp_registry() if hasattr(agent, 'mcp_registry') else get_registry()
-        parts = arg.split(None, 2)
-        sub = (parts[0] if parts else '').lower()
-        if not sub or sub in ('list', 'ls'):
-            print(ok('MCP servers（内置 ascend-doc = 昇腾文档）'))
-            for s in reg.list_servers():
-                flag = 'disabled' if s.get('disabled') else 'on'
-                desc = s.get('description') or ''
-                print(mute(f"  • {s['name']} [{flag}] {s.get('command')} {' '.join(s.get('args') or [])}"))
-                if desc:
-                    print(mute(f'      {desc}'))
-            print(mute('用法: /mcp tools <server> · /mcp call <server> <tool> [json] · /mcp reload'))
-            return 'handled'
-        if sub == 'reload':
-            reg.reload()
-            print(ok('已重载 MCP 配置'))
-            return 'handled'
-        if sub == 'tools' and len(parts) >= 2:
-            info = reg.list_tools(parts[1])
-            if info.get('error'):
-                print(warn(info['error']))
-            else:
-                print(ok(f"MCP tools · {info.get('server')}"))
-                for t in info.get('tools') or []:
-                    print(mute(f"  • {t.get('name')}: {t.get('description') or ''}"))
-                if not info.get('tools'):
-                    print(mute('（无工具或启动失败；ascend-doc 需要 Node ≥ 22 + npx）'))
-            return 'handled'
-        if sub == 'call' and len(parts) >= 3:
-            server = parts[1]
-            rest = parts[2].strip()
-            # tool [json-args]
-            bits = rest.split(None, 1)
-            tool = bits[0]
-            args_obj = {}
-            if len(bits) > 1:
-                try:
-                    args_obj = json.loads(bits[1])
-                except json.JSONDecodeError:
-                    print(warn('arguments 必须是 JSON 对象'))
-                    return 'handled'
-            print(mute(f'MCP call {server}/{tool} …'))
-            if not isinstance(args_obj, dict):
-                print(warn('arguments 必须是 JSON 对象'))
-                return 'handled'
-            result = reg.call(server, tool, args_obj)
-            print(json.dumps(result, ensure_ascii=False, indent=2)[:8000])
-            return 'handled'
-        print(mute('用法: /mcp | /mcp tools ascend-doc | /mcp call ascend-doc <tool> {} | /mcp reload'))
-        return 'handled'
-
     if cmd == '/help':
         print(brand('审核 / 质检怎么用'))
         print(ok('0) AI自动调换（默认）'))
@@ -1373,11 +1320,11 @@ def chat(args: argparse.Namespace) -> int:
             else:
                 print(f"[ERROR] 无法恢复会话：{exc}")
             return 1
-        repository = getattr(args, 'repository', None)
-        if repository is not None:
-            agent.desktop_repository = str(Path(repository).expanduser().resolve()) if repository else ''
-        elif not hasattr(agent, 'desktop_repository'):
-            agent.desktop_repository = str(agent.work_root)
+    repository = getattr(args, 'repository', None)
+    if repository is not None:
+        agent.desktop_repository = str(Path(repository).expanduser().resolve()) if repository else ''
+    elif not hasattr(agent, 'desktop_repository'):
+        agent.desktop_repository = str(agent.work_root)
 
     def _reload_client(overrides=None):
         nonlocal client, agent
@@ -1680,7 +1627,7 @@ def main() -> int:
     review_parser.add_argument("--json", action="store_true", help="输出 JSON")
     review_parser.add_argument("--max-diff", type=int, default=12000)
     review_parser.add_argument("--require-full", action="store_true",
-                               help="diff 超出 --max-diff 时直接失败，不给出只覆盖部分改动的审查结果")
+                               help="diff 截断或包含未提供内容的二进制文件时直接失败")
     review_parser.add_argument("--scenario", choices=["operator", "inference", "opengauss"],
                                help="加载专业 Agent：operator=算子，inference=推理，opengauss=openGauss 社区；省略则自动判定")
     review_parser.add_argument("--require-scenario", action="store_true",

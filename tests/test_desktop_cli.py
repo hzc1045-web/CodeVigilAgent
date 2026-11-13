@@ -32,6 +32,23 @@ class FakeModel:
 
 
 class DesktopChatTests(unittest.TestCase):
+    def test_repository_is_used_for_file_mentions_without_named_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repository = Path(tmp) / 'chosen-repository'
+            repository.mkdir()
+            (repository / 'selected.py').write_text('SELECTED_REPO_SENTINEL = 1\n', encoding='utf-8')
+            model = FakeModel()
+            output = io.StringIO()
+            argv = ['ascend_cli.py', 'chat', '--message', 'explain @selected.py',
+                    '--repository', str(repository), '--network', 'off', '--json']
+            with patch.dict(os.environ, {'REVIEWAGENT_HOME': str(Path(tmp) / 'home')}), \
+                    patch('scripts.conversation_agent.KnowledgeSearch', return_value=FakeKnowledge()), \
+                    patch.object(ascend_cli, 'get_ai_client', return_value=model), \
+                    patch('sys.argv', argv), contextlib.redirect_stdout(output):
+                self.assertEqual(ascend_cli.main(), 0)
+            self.assertTrue(json.loads(output.getvalue())['ok'])
+            self.assertIn('SELECTED_REPO_SENTINEL', json.dumps(model.calls[0]))
+
     def test_named_session_keeps_fake_model_history_and_new_session_isolated(self):
         with tempfile.TemporaryDirectory() as home:
             model = FakeModel()

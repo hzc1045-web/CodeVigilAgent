@@ -250,6 +250,7 @@ private final class ModelSettingsForm: NSObject, NSTextFieldDelegate {
     /// 切回原厂商时把原密钥填回去。
     private let existingBaseURL: String
     private let savedKey: String
+    private var keyGateway: [String]
     private var keyMissing = false
     /// selection() 失败的原因，供调用方原样显示（比固定文案准确）
     private(set) var validationError: String?
@@ -262,6 +263,8 @@ private final class ModelSettingsForm: NSObject, NSTextFieldDelegate {
         existingBaseURL = (existing["base_url"] as? String ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         savedKey = existing["api_key"] as? String ?? ""
+        keyGateway = Self.gateway(provider: existingProvider.isEmpty ? "deepseek" : existingProvider,
+                                  baseURL: existingBaseURL)
         super.init()
         buildViews(existing: existing, load: load)
     }
@@ -273,9 +276,11 @@ private final class ModelSettingsForm: NSObject, NSTextFieldDelegate {
         baseURLField.stringValue = existingBase
         baseURLField.placeholderString = "默认地址（可留空）"
         keyField.placeholderString = "留空以保留现有密钥"
+        keyField.stringValue = savedKey
         customModelField.placeholderString = "清单里没有的模型名（私有部署用）"
         // 自定义模型框始终可编辑；打字时会自动把模型下拉切到「自定义模型…」
         customModelField.delegate = self
+        baseURLField.delegate = self
 
         let providerLabel = NSTextField(labelWithString: "服务商")
         let modelLabel = NSTextField(labelWithString: "模型")
@@ -390,22 +395,31 @@ private final class ModelSettingsForm: NSObject, NSTextFieldDelegate {
     @objc private func providerChanged(_ sender: NSPopUpButton) {
         let entry = selectedEntry()
         // 切厂商时自动带出该厂商的 base_url；用户之后仍可手动改
-        baseURLField.stringValue = entry?.baseURL ?? ""
+        baseURLField.stringValue = entry?.baseURL ?? existingBaseURL
         populateModels(for: entry, preferred: entry == nil ? existingModel : "")
-        // 各家密钥不通用：换了厂商还留着旧 key，调用必然 401。
-        // 直接清空并提示，避免用户看到一串圆点以为已经填好。
-        let newBase = (entry?.baseURL ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if newBase != existingBaseURL {
-            if !keyField.stringValue.isEmpty {
-                keyField.stringValue = ""
-            }
-            keyMissing = true
-            showHint("已切换到 \(entry?.label ?? "该厂商")\n旧密钥已清空，请填写它的 API Key。")
-        } else {
-            if keyField.stringValue.isEmpty, !savedKey.isEmpty {
-                keyField.stringValue = savedKey
-            }
-            keyMissing = false
+        syncKeyForGateway()
+    }
+
+    private static func gateway(provider: String, baseURL: String) -> [String] {
+        var base = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        while base.hasSuffix("/") { base.removeLast() }
+        return [provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), base]
+    }
+
+    private func syncKeyForGateway() {
+        let provider = selectedEntry()?.fileProvider
+            ?? (existingProvider.isEmpty ? "deepseek" : existingProvider)
+        let target = Self.gateway(provider: provider, baseURL: baseURLField.stringValue)
+        let original = Self.gateway(provider: existingProvider.isEmpty ? "deepseek" : existingProvider,
+                                    baseURL: existingBaseURL)
+        if target != keyGateway {
+            keyGateway = target
+            keyField.stringValue = target == original ? savedKey : ""
+        }
+        keyMissing = target != original
+        if keyMissing {
+            showHint("服务商或 API 地址已变更\n请填写该地址对应的 API Key。")
+        } else if !displayedEntries.isEmpty {
             showHint("模型清单来自终端 CLI（\(displayedEntries.count) 个厂商）。", color: .secondaryLabelColor)
         }
     }
@@ -421,7 +435,12 @@ private final class ModelSettingsForm: NSObject, NSTextFieldDelegate {
     /// 在「自定义模型」里打字 → 模型下拉自动跳到「自定义模型…」。
     /// 这样用户不用先在下拉里选一次，保存时也一定用的是他写的名字。
     func controlTextDidChange(_ obj: Notification) {
-        guard let field = obj.object as? NSTextField, field === customModelField else { return }
+        guard let field = obj.object as? NSTextField else { return }
+        if field === baseURLField {
+            syncKeyForGateway()
+            return
+        }
+        guard field === customModelField else { return }
         let text = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         if modelPopup.indexOfSelectedItem != displayedModels.count {
@@ -433,6 +452,7 @@ private final class ModelSettingsForm: NSObject, NSTextFieldDelegate {
     /// 失败原因写进 validationError，调用方原样显示即可。
     func selection() -> (provider: String, model: String, baseURL: String)? {
         validationError = nil
+        syncKeyForGateway()
         let modelIndex = modelPopup.indexOfSelectedItem
         // 手填框有内容就以它为准（和 Windows 端 prefer_custom 规则一致）；
         // 否则命中清单取下拉项，落在「自定义模型…」取文本框
@@ -447,8 +467,7 @@ private final class ModelSettingsForm: NSObject, NSTextFieldDelegate {
         }
         let key = keyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if keyMissing, key.isEmpty {
-            let name = selectedEntry()?.label ?? "该厂商"
-            validationError = "还没填 \(name) 的 API Key\n留空保存会沿用旧厂商的密钥，调用一定失败。"
+            validationError = "还没填新服务商或地址的 API Key\n请填写后再保存。"
             return nil
         }
         // 「保持原值」场景下 provider 沿用配置里的值；两者都空时用内置默认，避免写空字符串
@@ -712,8 +731,8 @@ final class CodeVigilAgentDelegate: NSObject, NSApplicationDelegate, NSWindowDel
         // NSTextView 放进 NSScrollView 时必须显式声明「宽跟随、高自由」。
         // 不声明的话 textContainer 宽度可能是 0，文字会被挤成一列、互相重叠。
         outputView.minSize = NSSize(width: 0, height: 0)
-        outputView.maxSize = NSSize(width: .greatestFiniteMagnitude,
-                                    height: .greatestFiniteMagnitude)
+        outputView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                    height: CGFloat.greatestFiniteMagnitude)
         outputView.isVerticallyResizable = true
         outputView.isHorizontallyResizable = false
         outputView.autoresizingMask = [.width]

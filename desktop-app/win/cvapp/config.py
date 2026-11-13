@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
-from . import HERE
+from . import HERE, ROOT
 
 
 def _config_path() -> str:
@@ -45,9 +46,11 @@ def load_config() -> dict:
 
 
 def save_config(data: dict) -> None:
-    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=2)
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    from scripts.agent_home import write_config
+
+    write_config(data, CONFIG_PATH)
 
 
 def load_last_repo() -> str:

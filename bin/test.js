@@ -11,7 +11,15 @@ try {
     windowsHide: true,
   });
   if (result.error) throw result.error;
-  process.exitCode = result.status === null ? 1 : result.status;
+  if (result.status !== 0) {
+    process.exitCode = result.status === null ? 1 : result.status;
+  } else {
+    const wizard = spawnSync(process.execPath, [path.join(__dirname, '..', 'tests', 'test_wizard_confirm.js')], {
+      cwd: path.join(__dirname, '..'), stdio: 'inherit', windowsHide: true,
+    });
+    if (wizard.error) throw wizard.error;
+    process.exitCode = wizard.status === null ? 1 : wizard.status;
+  }
 } catch (error) {
   console.error(error.message);
   process.exitCode = 1;

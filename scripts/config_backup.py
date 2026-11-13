@@ -43,9 +43,15 @@ def create_backup(config_path, tag: str = 'manual',
     if not source.is_file():
         return None
     target_dir = Path(directory) if directory else backup_dir()
-    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if directory is None and not (os.environ.get('REVIEWAGENT_BACKUP_DIR') or '').strip():
+        target_dir.chmod(0o700)
+    source.chmod(0o600)
     target = _unique_path(target_dir, tag)
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
     shutil.copy2(source, target)
+    target.touch()  # 保留策略按备份时间排序，不能沿用恢复过的旧配置时间。
     _prune(target_dir, keep)
     return target
 
@@ -92,7 +98,19 @@ def restore_backup(config_path, name: Optional[str] = None,
     target_dir = Path(directory) if directory else backup_dir()
     source = _pick(name, list_backups(target_dir))
     config = Path(config_path).expanduser()
-    safety = create_backup(config, tag='before-restore', directory=target_dir)
-    config.parent.mkdir(parents=True, exist_ok=True)
+    if source.resolve() == config.resolve():
+        raise ValueError('恢复源与配置文件不能是同一个文件')
+    if config.exists() and not config.is_file():
+        raise ValueError('恢复目标必须是普通文件，不能是目录')
+    source.chmod(0o600)
+    # 恢复成功后再裁剪，避免安全备份先删除这次选中的恢复源。
+    safety = create_backup(config, tag='before-restore', directory=target_dir, keep=0)
+    config.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if config.exists():
+        config.chmod(0o600)
+    else:
+        fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(fd)
     shutil.copy2(source, config)
+    _prune(target_dir, DEFAULT_KEEP)
     return source, safety

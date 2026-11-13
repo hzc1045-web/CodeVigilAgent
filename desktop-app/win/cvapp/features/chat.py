@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 
 from .. import ROOT
 from .base import Feature
@@ -11,14 +12,20 @@ def send(app, text: str) -> None:
     text = (text or '').strip()
     if not text:
         return
+    if app.runner.busy:
+        app.append('\n上一个任务还没结束，请等待或取消后再发送。\n', 'err')
+        return
+    repo = app.current_repo()
+    repo = os.path.realpath(repo) if repo and os.path.isdir(repo) else ''
+    if getattr(app, 'chat_repository', None) != repo or not getattr(app, 'chat_session', None):
+        app.chat_repository = repo
+        app.chat_session = 'desktop-win-' + uuid.uuid4().hex
     args = [
         app.runner.python(), os.path.join(ROOT, 'ascend_cli.py'),
         'chat', '--message', text, '--network', 'auto',
+        '--session', app.chat_session, '--repository', repo,
     ]
-    repo = app.current_repo()
-    if repo and os.path.isdir(repo):
-        args += ['--repository', repo]
-    app.run_cli(args, cwd=ROOT, label='提问')
+    app.run_cli(args, cwd=repo or ROOT, label='提问')
 
 
 FEATURES = [

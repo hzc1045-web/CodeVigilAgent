@@ -24,6 +24,8 @@ class Shell:
         self.features = features
         self.load_errors = load_errors or []
         self.buttons: dict[str, FlatButton] = {}
+        self.chat_session: str | None = None
+        self.chat_repository: str | None = None
         self.repo_var = tk.StringVar(value=config.load_last_repo())
         self.status_var = tk.StringVar(value='就绪')
         self.font_ui = theme.ui_font(11)
@@ -165,6 +167,9 @@ class Shell:
     def submit(self) -> None:
         text = self.entry.get().strip()
         if not text:
+            return
+        if self.runner.busy:
+            self.append('\n上一个任务还没结束，请等待或取消后再发送。\n', 'err')
             return
         self.entry.delete(0, 'end')
         feature = next((f for f in self.features if f.placement == 'input'), None)
